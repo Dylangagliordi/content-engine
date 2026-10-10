@@ -157,10 +157,50 @@ These resolve the "open questions" that were blocking a concrete execution plan:
 (foundations: Docker/Postgres/n8n stack, Python project with uv, Pydantic contracts, model-tiering
 helper, eval harness skeleton, seeded v0 playbook) and Phase 1 (tracer bullet: Write engine → Design
 engine → eval gate → manual publish → manual performance logging, IG statics only, no automated
-learning yet). Each task has exact file paths, code, and a verify step. Phase 2+ stays at
-roadmap-level in `v2-engineering-plan.md` until Phase 1's exit criteria are met — there's no real
-performance data to mine insights from until then.
+learning yet). Each task has exact file paths, code, and a verify step.
 
-Immediate next action if picking this back up: run Task 0.1 (`brew install --cask orbstack`) —
-flagged in the execution plan as needing explicit approval since it installs system software — then
-proceed through Tasks 0.2–0.10 in order.
+## Phase 0 — COMPLETE (2026-10-10)
+
+All 10 tasks done, all 4 exit checks green:
+- OrbStack installed (`brew install --cask orbstack`) — Docker CLI works via `~/.orbstack/bin`
+  (auto-added to `.bash_profile`, new shells pick it up; this session needed a manual `export PATH`).
+- Project scaffolded under `~/qualume/src/qualume/{db,models,llm,graphs,eval,ingest}` + `tests/`.
+- `uv init` + deps installed: langgraph, langchain-anthropic, pydantic, psycopg2-binary,
+  python-dotenv, pytest, pillow. All import cleanly.
+- `.env` created from `.env.example` (gitignored); real `ANTHROPIC_API_KEY` set by user and
+  verified live against the Anthropic API (made an actual API call, got a response).
+- Verified live Claude model IDs via `anthropic.Anthropic().models.list()` — do NOT trust
+  placeholder model names, the real working ones as of 2026-10-10 are: `claude-haiku-4-5`,
+  `claude-sonnet-4-5`, `claude-opus-4-5` (all three confirmed working via live `.invoke()` calls).
+- `docker-compose.yml` brings up Postgres 17 (port 5433) + n8n (port 5678). Both confirmed running
+  and responsive.
+- Schema migration (`src/qualume/db/migrations/001_init_schema.sql`) applied — 8 tables exist:
+  content_items, creative_dna, performance_snapshots, ad_performance, experiments, insights,
+  playbooks, eval_runs.
+- Pydantic contracts (`src/qualume/models/contracts.py`) built TDD-style (RED confirmed before
+  implementation) — `RawContentRecord`, `CreativeDNA`, `CampaignBrief`, `ScriptVariant`,
+  `DesignRequest`, `DesignOutput`. 3 tests passing.
+- Model-tiering helper (`src/qualume/llm/pick_llm.py`) — `pick_llm("low"|"medium"|"high")` using the
+  verified model IDs above. 2 tests passing.
+- Eval harness skeleton (`src/qualume/eval/harness.py`) — deterministic `must_include`/`must_avoid`
+  constraint checks (no LLM judge yet, intentionally — that's added once there's a real Write
+  prompt to score). 3 tests passing. Golden set seeded at
+  `src/qualume/eval/golden_sets/ig_static_write_v1.jsonl` (3 hand-written examples).
+- v0 `ig_static` playbook seeded BOTH as a DB row (`playbooks` table,
+  `source: external_field_notes, tier: proposed`) and as a Hermes skill (`ig-static-playbook`,
+  readable via `skill_view(name='ig-static-playbook')`) — explicitly marked unproven, not to be
+  cited as "what works" until real performance data validates it.
+- All 8 pytest tests passing. Git history: 6 commits, from initial scaffold through Phase 0 complete.
+
+**Known gotcha for next session:** `docker`/`docker compose` need
+`export PATH="$HOME/.orbstack/bin:$PATH"` in any NEW terminal session that was started before
+OrbStack was installed, OR just open a fresh terminal (OrbStack already added itself to
+`~/.bash_profile` so brand-new shells get it automatically).
+
+## Immediate next action
+
+Start Phase 1 (tracer bullet) per `plans/execution-plan-phase-0-1.md` §2: Task 1.1 (Write engine
+LangGraph for ig_static), then 1.2 (Design engine, Pillow template rendering), 1.3 (wire into a batch
+script with eval gate), 1.4 (manual review/publish), 1.5 (manual performance-entry CLI), and 1.6
+(start the Instagram Graph API access setup in parallel — has external approval latency, don't block
+on it).
