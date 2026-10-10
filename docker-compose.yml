@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: qualume-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - qualume_pg_data:/var/lib/postgresql/data
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: qualume-n8n
+    restart: unless-stopped
+    ports:
+      - "${N8N_PORT}:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+    volumes:
+      - qualume_n8n_data:/home/node/.n8n
+
+volumes:
+  qualume_pg_data:
+  qualume_n8n_data:
