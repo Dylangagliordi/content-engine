@@ -3,4 +3,4 @@
 __pycache__/
 .env
 data/*.db
-data/assets/*.png
+data/assets/
