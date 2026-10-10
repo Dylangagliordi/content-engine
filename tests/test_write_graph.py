@@ -1,5 +1,8 @@
 from unittest.mock import patch, MagicMock
 
+import pytest
+
+from qualume.graphs import write_ig_static
 from qualume.graphs.write_ig_static import (
     run,
     AngleList,
@@ -7,6 +10,12 @@ from qualume.graphs.write_ig_static import (
     CritiqueResult,
 )
 from qualume.models.contracts import CampaignBrief, ScriptVariant
+
+
+@pytest.fixture(autouse=True)
+def _isolated_attempt_log(tmp_path, monkeypatch):
+    """Keep self_critique's per-attempt log out of the real data/ directory."""
+    monkeypatch.setattr(write_ig_static, "ATTEMPT_LOG_PATH", str(tmp_path / "attempts.jsonl"))
 
 
 def _fake_structured_llm(responses):
@@ -84,7 +93,8 @@ def test_write_graph_filters_out_failed_critique(mock_pick_llm, mock_load_playbo
         offer_or_goal="test goal",
         playbook_version="pending",
     )
-    variants = run(brief, count=1)
+    # max_attempts=1 = no retry; the retry path is covered in test_write_retry_loop.py.
+    variants = run(brief, count=1, max_attempts=1)
 
     assert len(variants) == 0
 

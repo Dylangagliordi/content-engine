@@ -4,3 +4,4 @@ __pycache__/
 .env
 data/*.db
 data/assets/
+data/eval_logs/
