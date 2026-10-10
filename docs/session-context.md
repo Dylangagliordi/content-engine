@@ -204,3 +204,59 @@ LangGraph for ig_static), then 1.2 (Design engine, Pillow template rendering), 1
 script with eval gate), 1.4 (manual review/publish), 1.5 (manual performance-entry CLI), and 1.6
 (start the Instagram Graph API access setup in parallel — has external approval latency, don't block
 on it).
+
+## Phase 1 — IN PROGRESS (2026-10-10)
+
+Tasks 1.1-1.3, 1.5 done and verified live. Task 1.4 (manual publish) is blocked on YOU, not on code —
+waiting for you to pick one of 5 generated images and actually post it to Instagram. Task 1.6
+(Graph API setup) not started yet.
+
+- **1.1 Write engine** (`src/qualume/graphs/write_ig_static.py`) — LangGraph stateful-orchestration
+  graph: load_playbook → ideate_angles → generate_variants → self_critique. Model tiering:
+  pick_llm("medium") for ideation/generation, pick_llm("low") for the critique pass. Verified live
+  against real Claude API — produced genuinely distinct, on-topic hook/body/CTA copy. Unit tests use
+  mocked LLMs (don't hit the real API in tests) — 2 tests, both passing.
+- **1.2 Design engine** (`src/qualume/graphs/design_ig_static.py`) — Pillow template rendering, NOT
+  an image-gen model (deliberate Phase 1 simplification — deterministic, zero-API-cost). Template:
+  `data/templates/template_cream_square.png` (plain cream 1080x1080 square, generated programmatically,
+  no real brand kit yet since greenfield). Render-determinism test confirms byte-identical output for
+  identical input. Visually verified via screenshot — clean, legible layout, no overflow. 4 tests
+  passing.
+- **1.3 Batch runner** (`src/qualume/run_batch.py`) — wires Write → eval gate → Design → Postgres
+  persist. **Caught and fixed a real bug during build**: the original eval-gate design tried to match
+  a brief to the "closest" golden-set example by keyword overlap, silently falling back to an
+  unrelated example (e.g. requiring the word "journal" in a wallet ad) when no match existed — this
+  would have silently broken the gate for almost any real brief. Fixed by splitting the gate into (a)
+  a universal must_avoid list (banned claims like "guaranteed results" — unioned across all golden
+  examples, applies to any brief) and (b) a per-brief must_include derived from the brief's own text
+  via a stopword-based keyword extractor, tested against both the original and an unrelated product
+  category to confirm it generalizes. 4 regression tests added for this fix, all passing.
+- **1.5 Manual performance-entry CLI** (`src/qualume/ingest/manual_entry.py`) — Phase 1a per the
+  execution plan's greenfield adaptation (no Graph API access yet, log stats by hand). Append-only
+  (never upserts) — tested explicitly that logging twice produces two rows, not one updated row, per
+  the v2 plan's immutability principle. 3 tests passing, verified live against the real DB.
+- Also built along the way (not originally itemized as separate tasks but needed): `src/qualume/
+  config.py` (env loader) and `src/qualume/db/connection.py` (psycopg2 connection helper) —
+  prerequisites for everything above; `src/qualume/db/playbook_loader.py` (loads the active playbook
+  row for a workflow_type, raises loudly if none exists) — 2 tests passing.
+- **Current state**: 5 real draft content_items in Postgres (2 productivity-journal variants, 3
+  water-bottle variants from a deliberately different product category used to test the eval-gate
+  fix), each with a rendered PNG in `data/assets/` (gitignored — generated artifacts, not source) and
+  full creative_dna + provenance (playbook_version, prompt_versions_used for ideation/write/design).
+  23/23 tests passing across the whole project.
+- **Gitignore gotcha hit twice**: `data/assets/*.png` only ignored top-level files, not files in
+  subdirectories created during tests (e.g. `data/assets/_test_tmp/...`) — two stray test-generated
+  PNGs got committed before this was caught and fixed. Current rule is `data/assets/` (whole dir
+  excluded). If a new nested asset dir pattern appears, verify it's actually excluded before
+  committing, don't assume.
+
+### Still blocked / not started
+- **Task 1.4 (manual publish)**: genuinely needs YOU — review the 5 generated images (one shown
+  inline in session: a stainless-steel water-bottle ad, "Your gym bottle smells like a locker room by
+  Friday"), pick one, post it to Instagram yourself. Not something Hermes can or should do
+  autonomously. Once posted, update that content_item's status to 'published' in Postgres:
+  `UPDATE content_items SET status='published', published_at=now() WHERE id='<id>';` — then start
+  logging daily stats via Task 1.5's CLI.
+- **Task 1.6 (Graph API access)**: not started. No hard dependency on anything else — can run in
+  parallel whenever picked up. See execution plan §Task 1.6 for the exact steps (convert IG account
+  to Business/Creator, link FB Page, create Meta Developer App, generate token).
