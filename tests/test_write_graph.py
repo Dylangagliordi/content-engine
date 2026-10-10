@@ -113,7 +113,10 @@ def _system_block(messages):
 def test_every_llm_call_puts_static_rubric_in_cached_system_block(mock_pick_llm, mock_load_playbook):
     """Prompt caching: the rubric + fixed framing must sit in a SystemMessage block
     marked cache_control, byte-identical across calls within a node, and the
-    per-call variable content (brief, angle, copy) must NOT be in that block."""
+    per-call variable content (brief, angle, copy) must NOT be in that block.
+    Exception: the self_critique judge gets the brief as reference facts in its
+    system block (constant within a batch, so still cacheable) — see
+    test_write_claims_gate.py."""
     mock_load_playbook.return_value = {
         "version": "v0",
         "rubric": {"hooks": ["be concrete"], "format": ["one headline"]},
@@ -140,6 +143,10 @@ def test_every_llm_call_puts_static_rubric_in_cached_system_block(mock_pick_llm,
         for b in blocks:
             assert b["cache_control"] == {"type": "ephemeral"}
             assert "be concrete" in b["text"]
-            for variable in ("UNIQUE_PRODUCT", "UNIQUE_GOAL", "angle one", "Hook A"):
+            per_call = ("angle one", "Hook A")
+            brief = ("UNIQUE_PRODUCT", "UNIQUE_GOAL")
+            for variable in per_call if node_llm is critique else per_call + brief:
                 assert variable not in b["text"]
+            if node_llm is critique:
+                assert all(fact in b["text"] for fact in brief)
         assert all(b == blocks[0] for b in blocks)

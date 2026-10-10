@@ -15,14 +15,24 @@ number, pass/fail, full critique notes, decision). Comparison script:
 | API calls | 33 | 35 |
 | Lift from retry | — | 0 extra passing variants, for +2 calls (~$0.007) |
 
-## Verdict
-**Default set to `max_attempts=1` (retry off).** The code stays in place and is fully tested
-(5 dedicated retry tests + existing suite, 41/41 total) — flipping it back to 2 is a one-line
-change. Retry isn't worth it *yet* because the judge almost never fails anything (1/15 in this
-sample) — the bottleneck isn't "good copy getting unfairly rejected," it's that the judge is too
-lenient to begin with. Revisit this once the anti-fabrication rubric fix (below) makes the judge
-actually strict — at that point more variants will genuinely need a second attempt, and retry
-should be re-measured with the same script.
+## Verdict — UPDATED after the anti-fabrication fix (see below)
+**Default is now `max_attempts=2` (retry ON), re-measured with the stricter judge in place.**
+With the claims-gate fix applied, the SAME retry mechanism now measurably earns its cost:
+pass rate went from 11/15 (73%, no retry) to 15/15 (100%, retry once), for ~$0.03 extra total
+on a 3-brief/5-variant live sample. All 4 rescued variants had their flagged claims genuinely
+removed on retry, not just reworded. This supersedes the original "default 1 / retry off"
+verdict below, which was correct at the time but was measured against a judge that barely
+failed anything (1/15) — once the judge got strict, retry had real failures to rescue.
+
+Also fixed in this pass: `run()`/`run_state()` (what `run_batch.py` actually calls) had their
+own independent `max_attempts=2` default that was never synced with the state field's default —
+meaning retry was quietly already running in every real batch regardless of the field default.
+The field default now matches, closing that drift.
+
+### Original verdict (superseded, kept for history)
+Default set to `max_attempts=1` (retry off). Retry wasn't worth it *yet* because the judge
+almost never failed anything (1/15 in this sample) — the bottleneck wasn't "good copy getting
+unfairly rejected," it was that the judge was too lenient to begin with.
 
 ## Bigger finding: the eval gate is passing fabricated claims
 While reviewing the judge's actual notes on all 30 real-API variants generated during this test,
@@ -55,3 +65,25 @@ whether the copy "sounds good."
 Both are expected to raise the judge's failure rate meaningfully, which would also make the
 retry loop's cost/benefit worth re-measuring (the "remove the invented stat" feedback is exactly
 the kind of concrete, actionable critique note the retry mechanism is built to use).
+
+## Update (same day): both fixes built, retry re-measured
+- Playbook `ig_static/v1` (seeded via `uv run python -m qualume.db.seed_playbooks`) adds a `claims`
+  rubric category. `approved_by` is NULL, pending review.
+- Judge prompt `critique_v2`: brief facts go in the system block as `<brief_facts>` reference data
+  (not instructions), and the judge must list `unsupported_claims`. When the playbook has `claims`,
+  a non-empty list rejects the variant even if the judge said `passes=true`.
+- Replaying all 5 fabricated variants quoted above through the live judge: **5/5 now rejected**,
+  with each invented stat or feature listed verbatim.
+- Same comparison as before (3 briefs x 5 variants, `compare_retry_20261010T212030Z.jsonl`):
+
+| | max_attempts=1 | max_attempts=2 |
+|---|---|---|
+| Critique/final pass rate | 11/15 (73%) | 15/15 (100%) |
+| API calls | 33 | 41 |
+| Est. cost | $0.117 | $0.149 |
+| Lift | — | +4 passing variants (4/4 retries rescued), 2 extra calls per rescued variant |
+
+Retry now pays for itself. Calls per passing variant drop from 3.00 to 2.73, and every rescue
+removed the flagged claims without adding new ones. Known judge gaps (Haiku): it passed one implied
+insulation feature ("keeps your water ice-cold") with an empty claims list, and it is inconsistent on
+generic benefit phrasing ("helps you prioritize" was flagged, "track progress" was not).
