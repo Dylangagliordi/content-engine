@@ -48,6 +48,33 @@ PLAYBOOKS = [
         },
         "approved_by": None,  # pending human review
     },
+    {
+        # Free, MIT-licensed hypotheses from vyralcontent/content-skills (read in full
+        # 2026-10-10, see docs/playbook-additions-vyralcontent-2026-10-10.md). Still
+        # tier: proposed / source: external_field_notes — unvalidated against our own
+        # data, same discipline as v0's original Hormozi/ecommerce-video hypotheses.
+        # Deliberately NOT bundled into v1 (that was the content-safety fix only).
+        "workflow_type": "ig_static",
+        "version": "v2",
+        "rubric": {
+            **_IG_STATIC_V0,
+            "claims": [
+                "no statistics, percentages, test results, user/customer counts, or specific "
+                "product features that are not explicitly present in the brief text; this "
+                "overrides social_proof: a data point that is not in the brief must not be used",
+                "personal testimonials/anecdotes (first-person stories, customer quotes, "
+                "before/after experiences) must not be presented as fact unless the brief "
+                "explicitly provides them",
+            ],
+            "hooks": [
+                "state a concrete problem in plain language, avoid vague claims",
+                "avoid generic no-stakes questions (e.g. 'Did you know...?') as the opening line",
+                "the headline text and the visual/background must reinforce the same idea, not "
+                "say two disconnected things",
+            ],
+        },
+        "approved_by": None,  # pending human review
+    },
 ]
 
 
