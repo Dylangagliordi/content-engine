@@ -56,7 +56,7 @@ def test_write_graph_produces_expected_variant_count_and_contract(mock_pick_llm,
     for v in variants:
         assert isinstance(v, ScriptVariant)
         assert v.playbook_version == "v0"
-        assert v.prompt_version == "v1"
+        assert v.prompt_version == "v2"
         assert v.explore_or_exploit in ("explore", "exploit")
 
 
@@ -87,3 +87,49 @@ def test_write_graph_filters_out_failed_critique(mock_pick_llm, mock_load_playbo
     variants = run(brief, count=1)
 
     assert len(variants) == 0
+
+
+def _system_block(messages):
+    """Return the single text block of the leading SystemMessage in an invoke() call."""
+    from langchain_core.messages import SystemMessage
+
+    assert isinstance(messages[0], SystemMessage)
+    assert isinstance(messages[0].content, list) and len(messages[0].content) == 1
+    return messages[0].content[0]
+
+
+@patch("qualume.graphs.write_ig_static.load_active_playbook")
+@patch("qualume.graphs.write_ig_static.pick_llm")
+def test_every_llm_call_puts_static_rubric_in_cached_system_block(mock_pick_llm, mock_load_playbook):
+    """Prompt caching: the rubric + fixed framing must sit in a SystemMessage block
+    marked cache_control, byte-identical across calls within a node, and the
+    per-call variable content (brief, angle, copy) must NOT be in that block."""
+    mock_load_playbook.return_value = {
+        "version": "v0",
+        "rubric": {"hooks": ["be concrete"], "format": ["one headline"]},
+    }
+    ideate = _fake_structured_llm([AngleList(angles=["angle one", "angle two"])])
+    generate = _fake_structured_llm([
+        VariantDraft(hook_text="Hook A", body_text="Body A", cta_text="Shop now"),
+        VariantDraft(hook_text="Hook B", body_text="Body B", cta_text="Learn more"),
+    ])
+    critique = _fake_structured_llm([
+        CritiqueResult(passes=True, notes="fine"),
+        CritiqueResult(passes=True, notes="fine"),
+    ])
+    mock_pick_llm.side_effect = [ideate, generate, critique]
+
+    brief = CampaignBrief(
+        product_or_topic="UNIQUE_PRODUCT", offer_or_goal="UNIQUE_GOAL", playbook_version="pending",
+    )
+    run(brief, count=2)
+
+    for node_llm in (ideate, generate, critique):
+        calls = node_llm.with_structured_output.return_value.invoke.call_args_list
+        blocks = [_system_block(c.args[0]) for c in calls]
+        for b in blocks:
+            assert b["cache_control"] == {"type": "ephemeral"}
+            assert "be concrete" in b["text"]
+            for variable in ("UNIQUE_PRODUCT", "UNIQUE_GOAL", "angle one", "Hook A"):
+                assert variable not in b["text"]
+        assert all(b == blocks[0] for b in blocks)
