@@ -120,8 +120,47 @@ questions to either a SQL Analyst sub-agent or an ETL (Python/pandas) Analyst su
 
 ## Next steps (as of this writing)
 1. Decide whether to add a "LangGraph implementation patterns" section to the v2 plan with
-   pseudo-code per pillar (Read/Learn/Write/Design) incorporating the patterns above.
-2. Phase 0 execution: Postgres schema DDL + Pydantic contract models for each pillar's input/output
-   (see v2 plan §3.1 and §2), plus the first small golden eval sets.
-3. Confirm Phase 0 tooling choices still open in the plan (§7 risks / §8 next actions in v2): DB/
-   storage choice, annotation model, data providers, n8n/LangGraph hosting.
+   pseudo-code per pillar (Read/Learn/Write/Design) incorporating the patterns above. (Still open.)
+2. Execute `plans/execution-plan-phase-0-1.md` — see below, this is now the active work.
+
+## Phase 0/1 tooling decisions (confirmed 2026-10-10)
+
+These resolve the "open questions" that were blocking a concrete execution plan:
+- **LLM provider: Anthropic (Claude) only.** Used for annotation (Claude vision handles IG-static
+  image annotation directly), generation, and judge/critique calls. No Gemini/OpenAI in Phase 0/1.
+- **Infra: all local via Docker** on this machine (not cloud/hosted). Docker was NOT installed on
+  this machine as of 2026-10-10 — `docker --version` returned "command not found", no Docker
+  Desktop/OrbStack found in /Applications. First execution task installs OrbStack via
+  `brew install --cask orbstack` (needs explicit user approval — installs system software).
+- **Phase 1 pilot workflow: IG statics** (confirmed, matches v2 plan's recommendation — simplest
+  Design engine, no video assembly).
+- **Data reality: fully greenfield.** One Instagram account exists, zero posts, zero performance
+  data, no Meta Developer App / Graph API access configured yet. This is the single biggest factor
+  shaping the execution plan's Phase 1 shape:
+  - Automated IG ingestion (Graph API) requires IG Business/Creator conversion + FB Page link + Meta
+    Developer App + access token — a multi-day external-approval dependency that must NOT block the
+    tracer bullet.
+  - Solution: Phase 1 splits ingestion into **1a (manual performance entry via a small CLI script,
+    unblocked, start immediately)** and **1b (real Graph API ingestion, parallel task, no hard
+    blocking dependency on 1a)**.
+  - Phase 1 publish step is also manual (you post to IG by hand after reviewing generated assets) —
+    automating posting needs the same Graph API access as ingestion, not worth building before
+    Write/Design output is even proven worth posting.
+  - Design engine (Phase 1) uses **Pillow-based template rendering** (headline/body text placed onto
+    pre-made template backgrounds) rather than an image-gen model/service — simplest, zero-API-cost,
+    fully deterministic option to prove the pipeline shape first. Swapping in a real design-gen tool
+    is an explicit fast-follow, not a Phase 1 blocker.
+
+## Execution plan
+
+**`plans/execution-plan-phase-0-1.md`** is the concrete, bite-sized build plan for Phase 0
+(foundations: Docker/Postgres/n8n stack, Python project with uv, Pydantic contracts, model-tiering
+helper, eval harness skeleton, seeded v0 playbook) and Phase 1 (tracer bullet: Write engine → Design
+engine → eval gate → manual publish → manual performance logging, IG statics only, no automated
+learning yet). Each task has exact file paths, code, and a verify step. Phase 2+ stays at
+roadmap-level in `v2-engineering-plan.md` until Phase 1's exit criteria are met — there's no real
+performance data to mine insights from until then.
+
+Immediate next action if picking this back up: run Task 0.1 (`brew install --cask orbstack`) —
+flagged in the execution plan as needing explicit approval since it installs system software — then
+proceed through Tasks 0.2–0.10 in order.
