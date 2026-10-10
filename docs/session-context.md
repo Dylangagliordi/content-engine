@@ -260,3 +260,106 @@ waiting for you to pick one of 5 generated images and actually post it to Instag
 - **Task 1.6 (Graph API access)**: not started. No hard dependency on anything else — can run in
   parallel whenever picked up. See execution plan §Task 1.6 for the exact steps (convert IG account
   to Business/Creator, link FB Page, create Meta Developer App, generate token).
+
+## Reading engine pivot (2026-10-10) — user redirected focus
+
+After Phase 1 build progress above, user explicitly redirected: "lets focus on the reading engine and
+build up from there since everything relies on that." This is the right call — Read is the foundation
+the Learn engine depends on, and nothing existed for it yet. Also clarified real intent: wants to
+pull data from TikTok/Instagram videos "I choose" (not just own-account analytics), record as much
+data as wanted, and eventually run this 24/7 on dedicated hardware (Raspberry Pi) or cloud, learning
+continuously what content/videos perform well.
+
+### Platform research findings (verified live, not guessed)
+
+- **TikTok**: public video/profile metadata fully readable with `yt-dlp`, NO login required. Verified
+  live: pulled real views/likes/comments/reposts/duration/audio-track data from real public videos
+  and from a real account's full profile feed (`https://www.tiktok.com/@handle` returns a playlist of
+  all recent videos). One test video hit a transient "IP blocked" error — intermittent, not universal;
+  residential IPs (i.e. a home-based Pi) are less likely to trigger this than datacenter/VPS IPs.
+- **Instagram**: confirmed BLOCKED without an authenticated session — tested via both `yt-dlp` (error:
+  "Instagram sent an empty media response... check if accessible without being logged in") AND a real
+  browser session (two different live, currently-public Reels both showed "Post isn't available" when
+  not logged in). This is a hard platform-level requirement, not a Pi/IP issue — login cookies from a
+  real IG account are required for ANY IG content reading, own or others'. Carries real ToS violation
+  risk and account-flagging risk (temporary action blocks, shadow-restriction, possible disable) for
+  whichever account is used to scrape. User asked about using the business's real "greenbabe" account
+  for this — explicitly flagged the risk (flagging/restriction would hit the real business account,
+  not a disposable one) and recommended a separate/secondary account instead. User has NOT yet decided
+  (question outstanding as of this writing) — do not build IG scraping against greenbabe without an
+  explicit decision on this.
+- **Industry validation (web research, not guessing)**: this exact pattern (scheduled polling of
+  chosen accounts/hashtags → normalized schema → dataset → LLM pattern-mining) is a well-established,
+  commercially-productized approach — found real examples: SociaVault, Exolyt, Virlo, Kalodata (all
+  commercial "social media intelligence" products built on this), and a notable open-source reference,
+  `ScrapeCreators/social-media-research-skills` (2,900+ GitHub stars) — an AI-agent skill toolkit for
+  exactly this kind of research (outlier-post-finder, transcript-intelligence, creator-profile-teardown
+  skills). Apify's own documented architecture guide confirmed: self-hosting beats their paid platform
+  specifically at "stable, moderate-volume workloads" (2 vCPU/2GB RAM tier) — which matches this
+  project's actual expected usage (a handful of watched accounts, polled every few hours), validating
+  the self-hosted approach already being built rather than needing a paid scraping API.
+
+### Raspberry Pi vs cloud decision (discussed, Pi favored, not yet purchased)
+
+- Pi 5 (8GB) ≈ $100-130 one-time + ~$1/month electricity (5-8W continuous draw for this workload).
+  Cloud VPS ≈ $5-6/month forever (no ceiling). Breakeven ~18-20 months; Pi cheaper after that and
+  increasingly so over time.
+- Bigger reason than pure cost: **residential IP from a home Pi is less likely to be detected/blocked
+  by TikTok/Instagram's anti-bot systems** than a datacenter/VPS IP range — this matters more for this
+  specific use case than the dollar difference.
+- Important nuance clarified to user: Pi fixes IP-detection risk for BOTH platforms, but does NOT
+  remove Instagram's login-wall requirement — that's a separate, harder constraint Pi doesn't solve.
+- Pi also generalizes well beyond this one engine: once there's an always-on Linux box, it can run
+  any number of scheduled jobs (systemd timers, cron, n8n's built-in scheduler) independent of whether
+  the Mac is open or Hermes is running — useful framing since user explicitly wants "more cron jobs"
+  over time.
+- User has not yet purchased a Pi. Current build is happening on the Mac, designed to be fully
+  portable (Docker Compose + Python project, no Mac-specific assumptions) so migration later is just
+  copying the project folder and running the same `docker compose up` on the Pi.
+
+### What's actually been built for the reading engine (Phase: Read engine, TikTok-only so far)
+
+New DB tables (migration `src/qualume/db/migrations/002_external_content.sql`), deliberately
+SEPARATE from the owned-content tables (`content_items` etc. from Phase 0/1) per the v2 plan's
+"two lanes, structurally separate, different trust levels" principle — external/competitor content
+should never be structurally conflatable with Qualume's own generated+published content:
+- `watched_accounts` — which TikTok (future: IG) accounts are being tracked, platform+handle unique,
+  active/inactive flag so you can pause watching an account without losing history.
+- `external_content_items` — one row per discovered video: platform_video_id (the TikTok ID — this
+  is the dedup key), url, caption, duration, audio track/artist, posted_at, full raw yt-dlp metadata
+  JSON (so nothing is lost even if we haven't modeled every field yet).
+- `external_performance_snapshots` — append-only, same pattern as owned-content's
+  `performance_snapshots`: views/likes/comments/shares over time, not just latest values.
+
+Code (`src/qualume/`):
+- `db/watchlist.py` — add/list/deactivate watched accounts. 3 tests passing.
+- `ingest/tiktok_reader.py` — `fetch_account_videos()` (wraps yt-dlp, pulls a profile's recent videos,
+  no login), `parse_video_entry()` (normalizes yt-dlp's raw dict into our schema, handles missing
+  fields gracefully rather than crashing), `ingest_videos_for_account()` (the core dedup logic — checks
+  platform_video_id before inserting, so re-polling an unchanged account inserts nothing new). 5 tests
+  passing, including a live-data verification run (polled a real account twice — first run: 5 new
+  videos; second run: 0 new, 5 correctly recognized as duplicates).
+- `poll_tiktok_watchlist.py` — the actual script a cron job/scheduler would invoke: sweeps every
+  active watched account, polite delay between accounts (avoid looking like a traffic burst), and
+  critically: **one account's failure doesn't kill the whole sweep** (try/except per-account, logged
+  and counted, loop continues) — tested explicitly with a simulated broken account among working ones.
+  2 tests passing.
+- `manage_watchlist.py` — convenience CLI (`add`/`list`/`deactivate`) for managing the watchlist by
+  hand. Verified live end-to-end.
+
+38 tests passing project-wide as of this commit. Live-verified against real TikTok data (not just
+mocks) — a real account (@scout2015, used only as a smoke-test target, then removed from the
+watchlist since it's not a genuine account to track) was polled twice, proving both the extraction
+and the dedup logic work against actual TikTok responses, not just test fixtures.
+
+### Immediate next steps for the reading engine
+1. User decides on the IG scraping account question (greenbabe directly vs. separate account vs.
+   skip IG for now) — currently unresolved.
+2. User populates the real watchlist with actual TikTok accounts/competitors they want tracked, via
+   `uv run python -m qualume.manage_watchlist add tiktok <handle>`.
+3. Set up actual scheduling (cron, or n8n's built-in scheduler since n8n is already running in
+   Docker) to call `poll_tiktok_watchlist.py` on a cadence — not yet wired up, currently a manual-run
+   script.
+4. Eventually: the annotation/Learn-engine pass over `external_content_items` (multimodal annotation,
+   pattern mining per v2 plan §2.2) — not started, this session only built Read.
+5. Raspberry Pi purchase + migration — not started, current work is fully portable to it when ready.
