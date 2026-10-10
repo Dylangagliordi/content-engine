@@ -21,8 +21,39 @@ def _make_test_content_item() -> str:
         conn.close()
 
 
-def test_log_snapshot_persists_row_with_manual_entry_method():
-    content_item_id = _make_test_content_item()
+def _delete_test_content_item(content_item_id: str) -> None:
+    """Clean up a throwaway content_item (and its snapshots via FK cascade).
+
+    No test fixture here is allowed to leave rows behind — this project has
+    no separate test DB yet, so every row left behind pollutes the real dev
+    counts (content_items.status='published' here is otherwise meaningful:
+    it means a human actually posted something). See CLAUDE.md principle 6.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM performance_snapshots WHERE content_item_id = %s",
+                (content_item_id,),
+            )
+            cur.execute(
+                "DELETE FROM content_items WHERE id = %s",
+                (content_item_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def content_item_id():
+    """A throwaway content_item id, auto-deleted (with its snapshots) after the test."""
+    cid = _make_test_content_item()
+    yield cid
+    _delete_test_content_item(cid)
+
+
+def test_log_snapshot_persists_row_with_manual_entry_method(content_item_id):
     log_snapshot(content_item_id, views=100, likes=10, saves=2, comments=1)
 
     conn = get_connection()
@@ -40,9 +71,8 @@ def test_log_snapshot_persists_row_with_manual_entry_method():
     assert row == (100, 10, 2, 1, "manual")
 
 
-def test_log_snapshot_allows_multiple_snapshots_over_time():
+def test_log_snapshot_allows_multiple_snapshots_over_time(content_item_id):
     """Append-only event log, not an upsert — v2 plan §1 principle 4."""
-    content_item_id = _make_test_content_item()
     log_snapshot(content_item_id, views=100, likes=10, saves=2, comments=1)
     log_snapshot(content_item_id, views=250, likes=30, saves=5, comments=3)
 
