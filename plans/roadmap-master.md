@@ -172,12 +172,28 @@ login required, deduped so re-polling never creates duplicate work.
 structured, versioned, statistically-validated insights that actually improve future generations.
 This is the part that makes "24/7 learning" literally true rather than just "24/7 data collection."
 
+**Full concrete design (schema, video-vibe-capture research, idea-sourcing mechanics):**
+`plans/learn-engine-idea-sourcing-architecture.md` — written 2026-10-12, read it before starting
+any 5a/5b/5c work below. It answers the question "when Write fires, where does the idea actually
+come from" with two sourcing modes (inspired-by-a-specific-video, and from-the-aggregate-summary),
+and specifies the `external_creative_dna` table, multi-watchlist support (`watchlist_type`), and
+the `data_overview` table that 5a-5c below assume exist.
+
 ### 5a. Multimodal annotation (turns raw video/image into structured CreativeDNA)
 - ⬜ Annotation pipeline using a vision-capable Claude call: watch/view each `external_content_items`
   row's video (or still frames) and `content_items` row's rendered image, extract hook_type,
   hook_text, visual_hook_description, format_tag, script_structure_tags, cta_type, audio info,
   social_proof_used — populate `creative_dna` (owned) and a new `external_creative_dna` table
   (external) with the same shape, kept in separate tables per the owned/external trust split.
+- ⬜ **Vibe/tone capture, not just literal content** (see architecture doc for full research): don't
+  rely on frames+transcript prose alone. Compute pacing (`PySceneDetect`, cuts-per-minute) and
+  music mood (`beatlyze-analyzer`, BPM/energy/valence from the audio waveform) deterministically
+  rather than having the LLM guess; use anchored numeric scales (not "rate 1-10" unanchored) for
+  the model-observed fields (`energy_level`, `tone_category`). Real precedent exists for this
+  shape: arXiv 2512.21402 builds essentially this pipeline. Worth a real side-by-side test of
+  Gemini's native video+audio understanding vs. the Claude frame-extraction workaround specifically
+  for this stage before committing either way — Gemini's architecture fuses audio+visual natively,
+  which the frame workaround can't fully replicate.
 - ⬜ Schema-validated structured output (reject/retry on malformed annotation output, per v2 plan's
   "fail loud" principle) — don't silently accept free-text junk into a structured field.
 - ⬜ Golden eval set for annotation quality — a small hand-labeled set of known videos with "ground
@@ -196,7 +212,10 @@ This is the part that makes "24/7 learning" literally true rather than just "24/
 - ⬜ Insight tiering lifecycle: `proposed` → `testing` → `accepted` → `retired`, each transition
   logged (the `insights` table already has a `state_history` JSONB column for this, unused so far).
 - ⬜ Minimum sample size gating — don't let a pattern seen in 3 data points masquerade as validated;
-  define and enforce a real threshold before promotion.
+  define and enforce a real threshold before promotion. The architecture doc sets a floor of ≥20
+  analyzed videos in scope before idea-sourcing Mode A (inspired-by-a-specific-video) activates.
+- ⬜ **Produces the `data_overview` table** (new, see architecture doc) — periodically regenerated,
+  versioned cross-video pattern summary, the input to idea-sourcing Mode B.
 
 ### 5c. Playbook authoring (closes the loop back into generation)
 - ⬜ Compile `accepted`-tier insights into a structured diff against the current playbook version for
