@@ -177,7 +177,7 @@ This is the part that makes "24/7 learning" literally true rather than just "24/
 any 5a/5b/5c work below. It answers the question "when Write fires, where does the idea actually
 come from" with two sourcing modes (inspired-by-a-specific-video, and from-the-aggregate-summary),
 and specifies the `external_creative_dna` table, multi-watchlist support (`watchlist_type`), and
-the `data_overview` table that 5a-5c below assume exist.
+the `insights.applies_to_segment` retrieval support that 5a-5c below assume exist.
 
 ### 5a. Multimodal annotation (turns raw video/image into structured CreativeDNA)
 - ⬜ Annotation pipeline using a vision-capable Claude call: watch/view each `external_content_items`
@@ -214,8 +214,11 @@ the `data_overview` table that 5a-5c below assume exist.
 - ⬜ Minimum sample size gating — don't let a pattern seen in 3 data points masquerade as validated;
   define and enforce a real threshold before promotion. The architecture doc sets a floor of ≥20
   analyzed videos in scope before idea-sourcing Mode A (inspired-by-a-specific-video) activates.
-- ⬜ **Produces the `data_overview` table** (new, see architecture doc) — periodically regenerated,
-  versioned cross-video pattern summary, the input to idea-sourcing Mode B.
+- ⬜ **Writes into `insights` with segment tags, queried live at generation time** (new
+  `applies_to_segment` column + feature registry, see architecture doc) — replaces an earlier
+  draft of this design that used a static periodically-regenerated summary doc; a live filtered
+  query per-brief is more useful than one flat document, see the doc's "Retrieval, not a static
+  summary doc" section.
 
 ### 5c. Playbook authoring (closes the loop back into generation)
 - ⬜ Compile `accepted`-tier insights into a structured diff against the current playbook version for
