@@ -1,59 +1,85 @@
-# Qualume — Session Handoff (2026-10-10, end of session)
+# Qualume — Session Handoff (2026-10-12)
 
 ## Start here next session
-Read this file first. Don't re-derive context from chat history — it's expensive. Detail docs
-referenced below have the full writeups if something needs deeper verification.
+Read this file first, not chat history. Detail docs referenced below have the full writeups.
 
-## Project state
-- Repo: ~/qualume, git-initialized, clean working tree as of this handoff (verify with `git log -5`)
-- Stack: Postgres 17 + n8n via OrbStack/docker-compose (both running), Python/uv, LangGraph,
-  Claude (Anthropic direct API + Claude Code CLI on Pro plan)
-- Built & working: Write engine (ig_static, LangGraph, with self_critique retry loop — currently
-  OFF by default, max_attempts=1), Design engine (Pillow, plain Python by design), run_batch.py
-  (Write->eval->Design->Postgres), TikTok reading engine (yt-dlp, no login, dedup verified live),
-  manual performance-logging CLI
-- Blocked: Instagram reading (needs account decision — greenbabe vs secondary, unresolved),
-  manual IG publish (waiting on user to post + report back content_item_id), IG Graph API setup
+## Project state (all verified, not assumed)
+- 51/51 tests passing. Git clean. Playbook at v2 (anti-fabrication claims rule + vyralcontent
+  hook hypotheses). Retry loop on by default (max_attempts=2, measured 73%->100% pass-rate lift
+  post-claims-fix). Zero TikTok accounts watched yet — reading engine built/tested but idle.
+  5 unpublished draft IG statics in data/assets/, nothing has ever actually been published.
+- Hermes itself now runs on Claude Pro subscription auth (CLAUDE_CODE_OAUTH_TOKEN), not API
+  credits — switched 2026-10-10 after diagnosing real spend. Qualume's own `.env` key is separate
+  and unaffected. Three distinct cost meters, still true: this Hermes session, Qualume's own API
+  key, Claude Code's Pro-plan session usage (separate daily cap).
 
-## PENDING — check this first
-A cron job (`qualume-antifab-retry-once`, id 69ed304fa788) was scheduled for 5:15pm ET today to
-retry a Claude Code task that hit a session-usage limit. Run `cronjob(action='list')` to check its
-status/output — it was told to leave changes staged (not committed) and report real verified
-numbers. If it completed, review its diff before committing. If it also failed, the task is in
-docs/retry-loop-verdict-2026-10-10.md's "Two proposed fixes" section — re-run manually, scoped
-smaller per the lesson learned (see below).
+## Current focus: designing Part 5 (Learn engine) before building it
+Full design: `plans/learn-engine-idea-sourcing-architecture.md` (revised twice same-week, see its
+own Revision log). Core shape as of 2026-10-12:
+- `external_creative_dna` (external content's structured-DNA table, mirrors owned `creative_dna`
+  + vibe fields) — NOT YET migrated into the DB.
+- `creative_dna_feature_registry` + `extended_features` JSONB — features are learned/promoted
+  over time via a "feature discovery" sub-step, not hardcoded forever.
+- Gemini DECIDED as the video-watching model (native audio+video fusion) — deliberate scoped
+  exception to Claude-only, every other stage stays Claude. CLAUDE.md still needs a line updated
+  to reflect this explicitly (attempted once, write requires explicit user approval on that
+  protected file, prompt timed out — ask user directly next time, don't force-retry).
+- No static "data overview" doc — retrieval against the existing `insights` table instead
+  (`applies_to_segment` JSONB addition), ranked by effect_size/sample_size/recency per-brief.
+  pgvector NOT installed (checked) — tag-based filtering first, semantic search is a real future
+  upgrade, not built ahead of need.
+- `content_items.grounding_refs` — closes the loop: a published post's real performance
+  re-validates (or weakens) the specific insight(s) that inspired it.
+- **Not yet added to the doc, discussed 2026-10-12, needs folding in next session**:
+  - Own-content performance should be judged against OUR OWN account's rolling median/stddev
+    baseline (not raw numbers) before counting as evidence for/against an insight — this was
+    MY design reasoning in conversation, NOT sourced from any GitHub repo (corrected a
+    mischaracterization where it was implied to be research-backed). Compute fresh at
+    query/mining time, don't persist as a column (append-only principle).
+  - Split `insights` into `insights_external` (mined from watched accounts, capped lower trust
+    even at tier=accepted) and `insights_owned` (tested against our own account, the one that
+    actually drives decisions) — mirrors the existing owned-vs-external table separation
+    principle already applied elsewhere in this schema. Third, lower-priority future table:
+    `insights_meta` (patterns about patterns, e.g. "hook insights have higher effect size than
+    CTA insights on average") — not urgent, no data to support it yet.
+  - The existing `experiments` table (batch_id, hypothesis, explore_exploit_ratio,
+    workflow_type, outcome_summary) is the actual mechanism for deliberately testing an insight
+    against our account — already built, under-referenced in the design doc so far, tie it in
+    explicitly rather than inventing a new mechanism.
+  - User's "planner vs do-er" question connects directly to the SQL Analyst LangGraph pattern
+    already researched in this project (way back, video summary, stateful orchestration): a
+    periodic pattern-miner (scheduled, mostly deterministic) vs. an ad hoc Analyst sub-agent
+    (SQL-analyst-shaped, answers on-demand questions like "does pacing matter independent of
+    length and niche" via real regression with those as covariates) vs. feature-discovery
+    (already designed). Not built, correctly deferred — zero data exists yet.
+  - Statistical method for mining: simple per-feature tests first (Welch's t-test / Mann-Whitney
+    U for continuous-vs-binary, chi-squared for categorical), NOT random forest (wrong tool for
+    clean interpretable effect-size-with-p-value statements) — regression is a deliberate later
+    upgrade once there's enough volume to control for confounders (e.g. the pacing-independent-
+    of-length-and-niche question). This reasoning exists in chat, not yet written into the doc.
 
-## Key recent decisions (full detail in docs/, don't re-litigate)
-- `docs/tool-division-of-labor.md`: Hermes=planning/research/verification, Claude Code=heavy
-  coding (delegated), n8n=plumbing only, LangGraph=the actual engine logic
-- `docs/retry-loop-verdict-2026-10-10.md`: conditional retry loop built & tested, but measured
-  live to add zero benefit at current rubric strictness — found a bigger problem instead: the
-  eval gate passes fabricated stats/claims (real examples logged). Fix queued (see PENDING above).
-- `docs/playbook-additions-vyralcontent-2026-10-10.md`: free MIT-licensed TikTok algorithm
-  insights staged, NOT yet written to the DB — waiting to fold in alongside the anti-fabrication
-  rubric fix as one clean playbook version bump (currently v0) instead of two racing edits.
-- `docs/cost-tooling-research-2026-10-10.md`: diagnosed the ~$20 Qualume API spend (no caching,
-  not a leak); prompt caching added to Write engine but currently dormant (rubric too small to
-  hit Anthropic's cache-eligibility threshold, ~2.6k tokens) — will activate automatically as the
-  playbook grows, no further action needed.
+## Repo research — corrections made 2026-10-12, keep these straight
+- `vyralcontent/content-skills` — MIT, free, genuinely useful, hook/algorithm hypotheses already
+  folded into playbook v2. Confirmed good.
+- `m13v/social-autoposter` ("S4L") — re-verified 2026-10-12, CORRECTED an earlier wrong
+  characterization (it is NOT a content-performance schema, it's a Reddit/X reply-drafting +
+  autopost plugin). Explicitly kept on the research list per user instruction — they may build a
+  SEPARATE future automation for comment/thread replies, unrelated to Qualume's content-creation
+  engine. Don't pull it into Qualume's scope; it's a parked idea for later, different project.
+- `ViralLab/SMDT` — re-verified 2026-10-12. Its "normalization" = cross-PLATFORM schema
+  standardization (Twitter fields vs Reddit fields -> one shared schema), NOT account-baseline
+  performance normalization. Don't conflate the two meanings — caught and corrected this
+  conflation in docs/cost-tooling-research-2026-10-10.md already.
+- PySceneDetect (pacing/cuts-per-min), beatlyze-analyzer (audio mood, PyPI), Essentia (heavier
+  audio-mood option, MTG) — all confirmed real and usable, in the architecture doc.
 
-## Lesson learned this session — apply going forward
-- **Keep Hermes sessions short and scoped.** This session ran to ~91M cumulative tokens / ~$34
-  (via `hermes insights --days 1`) from being one long continuous thread covering many unrelated
-  phases. Start a fresh session per work phase instead of one marathon thread.
-- **Push multi-step research (web_search/web_extract chains) into `delegate_task` subagents**
-  instead of inline — keeps the raw search noise out of the main session's context.
-- **Scope Claude Code tasks smaller.** A single 6-step delegated task hit the Pro plan's session
-  usage limit mid-run. Split big asks into 2-3 smaller invocations.
-- Three separate cost meters exist, don't conflate them: (1) this Hermes session's own token
-  cost, (2) Qualume's direct Anthropic API spend (`.env` key), (3) Claude Code's Pro-plan session
-  usage (separate limit, resets daily).
+## Known gap, not yet fixed
+Instagram scraping account decision (greenbabe vs. secondary) — still unresolved, still blocking
+Part 3. Not touched this session.
 
-## Immediate next actions (pick up here)
-1. Check the 5:15pm cron job result, verify its diff yourself (don't trust self-report), commit
-   if good.
-2. Fold the staged vyralcontent playbook additions in alongside it — one version bump (v0 -> v1).
-3. User still needs to decide: Instagram scraping account (greenbabe vs secondary) — blocking
-   Part 3 of the roadmap (see plans/roadmap-master.md).
-4. User offered to manually export a Canva design as PNG for review (OAuth Connect API setup
-   deferred as higher-effort than needed for a one-off look).
+## Immediate next action
+Fold the "not yet added" bullet list above into
+`plans/learn-engine-idea-sourcing-architecture.md` as a proper revision (same pattern as its
+existing two prior revisions) before any schema migration gets built. Nothing should be built
+until the watchlist actually has real accounts in it (still zero) — that remains the actual
+unblocking action if the user wants to move from design to real data.

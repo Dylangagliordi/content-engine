@@ -108,13 +108,27 @@ future `tiktok-video-playbook`) as additional seeded hypotheses — same honesty
 but it's free, well-reasoned, and platform-mechanics-grounded rather than vibes.
 
 **Other finds, noted but lower priority:**
-- `m13v/social-autoposter` — real production Postgres schema for a similar "post → track engagement
-  over time → benchmark against competitor replies" system. Worth a look later for schema ideas
-  (e.g. their `claude_sessions` table tracks per-session API cost — directly relevant to problem #1
-  above, we should probably build something similar to self-track our own spend going forward).
-- `ViralLab/SMDT` — general-purpose social data normalization toolkit (DuckDB-based, cross-platform
-  schema). More heavyweight/research-oriented than we need, but confirms our own owned/external
-  table-separation instinct is a recognized real pattern (they call it enrichment vs. raw ingestion).
+- `m13v/social-autoposter` (aka "S4L") — **correction, re-verified 2026-10-12**: this is NOT a
+  content-performance/engagement-tracking schema (my earlier characterization was wrong — either
+  the repo changed or I mischaracterized it originally). It's actually a Reddit/X **reply-drafting
+  and auto-posting** plugin: finds high-traffic threads, drafts contribution-first replies in your
+  voice, review queue, optional posting autopilot. **Not relevant to Qualume's content-generation/
+  Learn-engine pipeline** — different domain (conversation discovery + replies, not
+  TikTok/IG content performance mining) and its autopilot-posting capability runs counter to this
+  project's "publishing is always manual" principle anyway. **Keeping it on the list regardless**,
+  per explicit instruction (2026-10-12) — user may build a separate, distinct automation for
+  Reddit/comment-reply workflows later, unrelated to Qualume's content-creation engine. Worth
+  revisiting then, not now.
+- `ViralLab/SMDT` — general-purpose social data normalization toolkit (Postgres/TimescaleDB/
+  PostGIS-backed, re-verified 2026-10-12: 5 core tables — Communities/Accounts/Posts/Actions/
+  Entities — standardizes raw exports from 11+ platforms into one shared schema). Confirms our
+  own owned/external table-separation instinct is a recognized real pattern. Note: its
+  "normalization" means standardizing field names/schema ACROSS platforms (e.g. Twitter's
+  `like_count` vs Reddit's equivalent field mapping to one shared column) — NOT relative/baseline
+  performance normalization (e.g. judging a video against its own account's median). Don't
+  conflate the two meanings of "normalize" — this repo doesn't address the account-baseline idea
+  discussed 2026-10-12 (see `plans/learn-engine-idea-sourcing-architecture.md`), that idea came
+  from design discussion, not from this repo.
 
 ## 4. How we actually "see" TikTok's visuals/audio — the real gap, now actually solvable
 

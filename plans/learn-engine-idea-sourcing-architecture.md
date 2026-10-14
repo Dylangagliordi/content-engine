@@ -126,6 +126,64 @@ ALTER TABLE insights ADD COLUMN applies_to_segment JSONB DEFAULT '{}';
 No new "summary" table is needed — see "Retrieval, not a static summary doc" below for why a
 flat document was the wrong shape for this, and what replaces it.
 
+### Own-content performance needs a baseline — judge against OUR median, not raw numbers
+
+**This is design reasoning from conversation, not a sourced research finding** — flagging that
+explicitly after an earlier mischaracterization implied otherwise. A single post's raw
+view/save/like count can't be judged in absolute terms — it has to be judged against what's
+normal for OUR account specifically (same problem exists on the external-mining side too: a
+video from a 5M-follower account and a video from a 2K-follower account need different baselines,
+or pattern mining ends up just measuring "which accounts are big," not what makes content work).
+
+The fix: compute a rolling median/stddev baseline per account (ours included) and judge each
+post/video's performance as a z-score or percentile against THAT account's own recent normal —
+not stored as a persisted column (would violate the append-only principle already in place for
+`performance_snapshots`), computed fresh as a windowed aggregate query at mining/validation time.
+
+**One post does not "prove" or "disprove" an insight on its own.** An insight is a claim about an
+aggregate tendency, not a deterministic prediction for every instance — one data point barely
+moves a real statistical estimate, and a single post carries confounds beyond the insight itself
+(timing, that day's audience mood, Design-rendering quality, multiple insights combined in one
+piece pulling different directions). A below-baseline post is ONE MORE DATA POINT into the
+insight's running effect-size/sample-size/p-value recalculation — exactly the same mechanism
+external mining already uses, just a second, smaller, higher-trust evidence pool.
+
+### Two insights tables, not one — owned and external need different trust levels
+
+Mirrors a principle already deeply baked into this project elsewhere (CLAUDE.md principle 5:
+owned vs. external content never conflated, `content_items` vs. `external_content_items`). The
+same split belongs on insights:
+
+- **`insights_external`** — mined purely from watched-account data. Potentially high volume
+  (hundreds+), capped at a lower trust ceiling even at `tier: accepted` — "this worked for other
+  accounts" is not the same claim as "this works for us."
+- **`insights_owned`** — mined from and tested against our own `content_items` +
+  `performance_snapshots`, using OUR account's own median as baseline (see above). This is the
+  one that actually drives generation decisions, and it can meaningfully DIVERGE from the
+  external version of the same claim (accepted externally off a huge competitor sample, still
+  `proposed` or even contradicted against our own data) — one merged table couldn't represent
+  that divergence cleanly, two tables can.
+- **Future, lower priority, not built now**: `insights_meta` — patterns about patterns (e.g. "hook
+  insights have higher average effect size than CTA insights across the board") — a genuinely
+  distinct kind of analysis, not urgent with zero data to support it yet.
+
+Both tables keep the same schema shape (`tier`, `effect_size`, `sample_size`, `p_value`,
+`applies_to_segment`, `state_history`) — it's the trust/provenance boundary that's structurally
+separated, not the data model.
+
+### How an external insight actually gets validated against our account — use `experiments`, don't invent a new mechanism
+
+The `experiments` table already exists in this schema (`batch_id`, `hypothesis`,
+`explore_exploit_ratio`, `workflow_type`, `outcome_summary`) and is the real, already-designed
+mechanism for this — it was under-referenced in earlier drafts of this doc. An external insight
+gets deliberately tested by: generating a real batch through `run_batch.py` with an explicit
+`hypothesis` recorded (the insight being tested), tagging the resulting `content_items` via
+`grounding_refs`, publishing, then rolling the real (baseline-normalized) performance back into
+`insights_owned` as that hypothesis's first real evidence. This is "testing" in the literal
+`tier: proposed → testing → accepted` sense — `testing` tier specifically means "an `experiments`
+row exists for this and we're waiting on owned-account evidence," not just "waiting on more
+external data."
+
 ### Closing the loop — your own results re-validate the insights that inspired them
 
 ```sql
@@ -251,26 +309,75 @@ enough data exists. The ideation prompt changes from "invent angles for this bri
 grounding evidence — invent angles for this brief that apply what's actually been observed to
 work."
 
+## Statistical method for mining — a real decision, not left vague
+
+Simple per-feature tests FIRST, not regression or random forest, at least initially:
+- **Welch's t-test / Mann-Whitney U** for a continuous outcome (views, saves) split by a
+  binary/categorical DNA field (e.g. `energy_level=high` group vs `energy_level=low` group).
+- **Chi-squared** for categorical-vs-categorical association (e.g. does `hook_type=question`
+  correlate with higher completion-rate bucket than `hook_type=statement`).
+These are simple enough to unit-test against synthetic data with known injected correlations
+(the false-positive guard already planned in roadmap 5b), and they produce exactly the clean
+effect-size-with-p-value statement the `insights` tables are shaped to store.
+
+**Regression is a deliberate later upgrade**, not needed on day one: becomes genuinely useful once
+there are enough continuous features and enough volume to control for confounders simultaneously
+— e.g. "does pacing matter independent of video length and niche" (a real question raised in
+design discussion 2026-10-12) needs length/niche as covariates, which simple per-feature tests
+can't do alone.
+
+**Random forest (or any ML prediction model) is the wrong tool for INSIGHT GENERATION specifically**
+— it gives feature importances, not a clean interpretable "X causes Y, here's the effect size and
+confidence" statement, and needs far more data than this project will have for a long while to
+avoid overfitting on noise. It may show up later for a DIFFERENT job — predicting a new draft's
+likely performance before publish — but that's prediction, not insight-mining, and is explicitly
+out of scope for this doc.
+
+## Planner vs. do-er — an ad hoc Analyst sub-agent, reusing a pattern this project already knows
+
+Raised in design discussion 2026-10-12: the periodic pattern-miner above only answers questions it
+was built to ask on a schedule. A real question like "does pacing matter independent of length and
+niche" needs something that can go run the right statistical test on demand. This maps directly
+onto the **SQL Analyst pattern** from the LangGraph tutorial summarized early in this project
+(stateful orchestration: curate the raw question -> inject schema/context -> generate a query ->
+safety-check it -> execute -> represent the result in plain language) — nearly exactly suited to
+this job, reusing a pattern this project has real tested understanding of rather than inventing
+something new.
+
+Three distinct roles emerge, not one monolithic Learn engine:
+- **Periodic pattern miner** (5b, scheduled, mostly deterministic) — finds new candidate insights
+  via the t-test/chi-squared process above.
+- **Ad hoc Analyst** (new, SQL-Analyst-shaped) — answers specific on-demand questions, including
+  ones that want real regression with covariates (the pacing-independent-of-length-and-niche case
+  is a perfect example of when this sub-agent, not the scheduled miner, is the right tool).
+- **Feature discovery** (already designed above) — open-ended difference-spotting for uncaptured
+  dimensions.
+
+Correctly NOT built now — zero data exists yet, nothing to analyze. Capturing the shape so it's
+not re-derived from scratch later.
+
 ## Build sequencing (depends on, in order)
 
 1. TikTok watchlist actually populated (Part 2, already unblocked — zero accounts today)
 2. `external_creative_dna` (incl. `extended_features`) + `creative_dna_feature_registry` +
-   `watchlist_type` + `insights.applies_to_segment` + `content_items.grounding_refs` schema
-   migration
+   `watchlist_type` + split `insights` into `insights_external`/`insights_owned` (both with
+   `applies_to_segment`) + `content_items.grounding_refs` schema migration
 3. The video-watching pipeline: Gemini (model-observed signals) + PySceneDetect/beatlyze-analyzer
    (computed signals) → fused `external_creative_dna` row
 4. 20+ videos analyzed in at least one watchlist/niche before Mode A can activate
-5. First `insights` rows once there's enough analyzed volume for cross-video mining — Mode B
-   activates here. Feature-discovery sub-step (open-ended difference-spotting on top/bottom
-   performers) can start running in parallel once there's any meaningful volume, independent of
-   whether Mode A/B are live yet.
+5. First `insights_external` rows once there's enough analyzed volume for cross-video mining
+   (simple per-feature tests — t-test/chi-squared — not regression/random forest, see "Statistical
+   method for mining" above) — Mode B activates here. Feature-discovery sub-step can start running
+   in parallel once there's any meaningful volume, independent of whether Mode A/B are live yet.
 6. `gather_inspiration_node` added to the Write graph, wired to both modes
 7. Re-validate: does grounded ideation actually produce better content than today's ungrounded
    version? Needs a real A/B comparison (same discipline as the retry-loop and claims-gate
    verdicts already done this project) before trusting it, not assumed.
 8. Once real owned content has been published and gotten performance data back: wire the
-   `grounding_refs` feedback loop so published results re-validate (or weaken) the specific
-   insights that inspired them, not just feed new external data one-way.
+   `grounding_refs` feedback loop, judged against OUR account's own rolling median baseline (not
+   raw numbers), so published results accumulate into `insights_owned` and re-validate (or weaken)
+   the specific external insights that inspired them — via a real `experiments` row with a stated
+   hypothesis, not an ad hoc one-off check.
 
 ## Open questions, not resolved here
 
@@ -282,6 +389,11 @@ work."
   needs real insight data to calibrate against, can't be meaningfully set abstractly now.
 - Cadence for the feature-discovery sub-step (every N new videos? scheduled? triggered by
   mining-stage stagnation?) — decide once there's real volume to observe a cadence against.
+- Exact baseline window for own-account median (trailing N posts? trailing N days? both?) — needs
+  real publishing cadence data to pick sensibly, can't be set abstractly now.
+- When does the ad hoc Analyst sub-agent actually get built — likely well after the scheduled
+  miner and feature-discovery are already running and producing real questions worth asking it,
+  not before.
 
 ## Revision log
 
@@ -295,3 +407,19 @@ work."
   decided video-watching model (scoped exception to Claude-only), not an open question. Added
   `content_items.grounding_refs` to close the loop from owned-content performance back into the
   insights that inspired it.
+- **2026-10-12 (third revision, same week)**: added own-account median-baseline normalization for
+  judging owned-content performance (explicitly flagged as design reasoning from conversation, NOT
+  a sourced research finding — corrected an earlier ambiguous attribution). Split `insights` into
+  `insights_external` and `insights_owned` (different trust levels, can diverge on the same claim)
+  plus a noted future `insights_meta`. Tied owned-insight validation explicitly to the existing
+  `experiments` table instead of inventing a new mechanism. Decided the mining statistical method
+  (simple per-feature tests — t-test/chi-squared — first; regression as a later upgrade for
+  confounder-controlled questions; random forest ruled out for insight-generation specifically,
+  noted as possibly useful later for a different job — performance prediction). Added the
+  planner/do-er split (periodic miner vs. ad hoc Analyst vs. feature discovery), tied to the SQL
+  Analyst LangGraph pattern already understood in this project. Corrected the `m13v/
+  social-autoposter` repo characterization in docs/cost-tooling-research-2026-10-10.md (it's a
+  Reddit/X reply-drafting+autopost plugin, not a content-performance schema — kept on the research
+  list regardless per explicit user instruction, for a possible separate future project) and
+  clarified `ViralLab/SMDT`'s "normalization" means cross-platform schema standardization, not
+  account-baseline performance normalization — don't conflate the two.
