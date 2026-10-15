@@ -356,47 +356,63 @@ Three distinct roles emerge, not one monolithic Learn engine:
 Correctly NOT built now — zero data exists yet, nothing to analyze. Capturing the shape so it's
 not re-derived from scratch later.
 
-## Checklist enforcement — how an accepted insight actually becomes a rule, not just prose
+## Winning-traits checklist — concrete, growing, creation-time guidance (corrected 2026-10-12)
 
-**Grounding, flagged honestly**: this section was prompted by a single operator's podcast Q&A
-anecdote (summarized/transcribed 2026-10-12, not a published paper or tested framework) describing
-a "make 100, see what worked, add 2 checklist items, repeat" loop. Treat the general shape as a
-plausible hypothesis worth adapting, not a proven methodology to copy verbatim — same discipline
-as the original two reference videos in Appendix A.
+**Correction, same day**: the first version of this section (below, now relabeled) framed this as
+a post-hoc enforcement/gating mechanism (checking output after generation). That's not what the
+podcast anecdote actually describes, and the user corrected this directly. The real mechanism is
+simpler and points the OTHER direction — forward, into creation, not backward as a check on output.
 
-The gap this closes: "5c: tier + author playbook" was previously vague about HOW an accepted
-insight becomes an actual rule — it implied "add a sentence of prose to the rubric and hope Claude
-follows it." This project already has a stronger precedent for exactly this problem: the
-anti-fabrication fix didn't add advisory prose, it added a deterministic `unsupported_claims` check
-that OVERRIDES the model's own judgment. A checklist item is only as good as whether it's actually
-checked, not just suggested — so every accepted insight gets classified by how it's enforced, not
-just pasted into the playbook as another instruction:
+His exact words: "we look back at which ones did well and... point out what was different...
+next hundred we add two points to our checklist and do these extra two points." That's: identify
+concrete traits winners had in common, then actively DO those things while making the NEXT batch.
+A creation-time checklist, not a post-generation gate.
 
-- **`eval_check`** — if the insight is mechanically checkable (e.g. "hooks under N words
-  outperform longer ones"), it becomes a new deterministic function in the eval harness
-  (`src/qualume/eval/harness.py`), same pattern as the existing claims gate. Hard pass/fail,
-  never advisory.
-- **`design_constraint`** — if it's structural/layout (e.g. "product visible in first 2 seconds"),
-  it becomes a rule inside the Design engine's template logic directly — Design is already
-  deterministic plain Python, so this is adding a constraint there, never relying on an LLM to
-  remember it at generation time.
-- **`prompt_guidance`** — only genuinely unenforceable, judgment-based insights (tone, vibe,
-  "feels right") fall back to prose in the system prompt. Weakest tier, last resort, not the
-  default.
+**The real mechanism**: a literal, concrete, growing checklist of specific traits observed in
+common across our own actual winners (`insights_owned`, `tier: accepted`), each one worded as a
+direct action — not a statistical claim, not abstract retrieved evidence to "reason about" the way
+Mode B's retrieval currently works. Example shape:
 
-Each generated checklist item stores `derived_from_insight_id` (traceable back to exactly which
-insight produced it — same provenance discipline as everything else here) and gets its own
-pass-rate tracked after it's added, reusing the before/after measurement pattern already proven
-out on the retry loop (73%→100%, not vibes). An item that always trivially passes may be
-redundant; one that keeps failing either needs a stronger enforcement tier or should be
-reconsidered as not actually true.
+```
+[ ] Hook shows the product within the first 2 seconds
+[ ] Opens with a relatable problem statement, not a claim
+[ ] On-screen text matches the spoken/written hook
+```
 
-**Cap the batch size of new items per playbook version** — the transcript's "next hundred, add two
-points" (not fifty) taken literally: bumping too many checklist items into one playbook version at
-once makes it impossible to isolate which addition actually caused a measured change, the same
-confound-avoidance reasoning already applied to the insight-validity critic itself. A small,
-explicit cap (e.g. 2-3 new enforced items per version bump) keeps each version's effect
-measurable.
+This feeds directly into `ideate_angles`/`generate_variants` as explicit "make sure you do this"
+instructions for the next batch, and any structural item feeds the Design engine's deterministic
+template logic the same way. It grows incrementally — his "+2 per hundred" taken literally, same
+cap reasoning as before (small, explicit cap per playbook version, so each version's effect on
+real performance stays isolatable and measurable) — converting each newly `accepted`
+`insights_owned` row into one new checklist line, worded as an action, not a finding.
+
+Each checklist item still stores `derived_from_insight_id` (traceable to exactly which insight
+produced it) and gets its own pass-rate tracked after it's added (same before/after discipline as
+the retry loop, 73%→100%, not vibes) — that part of the original design was right, just attached
+to the wrong mechanism.
+
+**Grounding, flagged honestly**: adapted from a single operator's podcast Q&A anecdote
+(transcribed 2026-10-12), not a published methodology — treat as a hypothesis to adapt/test, same
+discipline as the Appendix A reference videos.
+
+## Output-side verification (secondary, built on top of the checklist above, not instead of it)
+
+The enforcement-tier idea from the original draft of this section still has real value — just as
+a SECOND, later layer (did the checklist actually get followed?), not the primary mechanism.
+Once a checklist item exists, it CAN optionally also get verified after generation:
+
+- **`eval_check`** — mechanically checkable items (e.g. "hooks under N words") become a new
+  deterministic function in the eval harness (`src/qualume/eval/harness.py`), same pattern as the
+  existing claims gate. Hard pass/fail, never advisory.
+- **`design_constraint`** — structural/layout items get enforced directly in the Design engine's
+  deterministic template logic, never left to an LLM to remember at generation time.
+- **`prompt_guidance`** — judgment-based items (tone, vibe, "feels right") stay as checklist prose
+  only, with no separate mechanical verification — the checklist instruction IS the whole
+  mechanism for these.
+
+This verification layer is optional and secondary — most of the real value is in handing Claude
+(and Design) the checklist to actively work from in the first place, not in catching violations
+after the fact.
 
 ## Explore/exploit cycling ("the accordion") — a real policy for an existing unused field
 
@@ -515,3 +531,12 @@ later.
   `insights_owned` evidence for a focus area is thin, shift to exploit as effect_size/sample_size
   strengthen, reset to explore once exploit-phase gains measurably flatten. First concrete link
   between the Learn engine's statistical output and the Write engine's actual batch effort/volume.
+- **2026-10-12 (fifth revision, same-day correction)**: user corrected the checklist-enforcement
+  section — it had been framed as post-hoc output verification (an enforcement gate), but the
+  podcast anecdote actually describes creation-time guidance (a checklist to actively DO while
+  generating the next batch), not a check on output after the fact. Relabeled as "winning-traits
+  checklist": a growing, literal, action-worded list derived from `insights_owned` accepted rows,
+  fed directly into `ideate_angles`/`generate_variants` and Design's template logic as affirmative
+  instructions. The original enforcement-tier idea (`eval_check`/`design_constraint`/
+  `prompt_guidance`) was kept but demoted to an optional secondary layer (verifying the checklist
+  was followed), not the primary mechanism.
