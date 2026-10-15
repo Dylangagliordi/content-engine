@@ -356,6 +356,80 @@ Three distinct roles emerge, not one monolithic Learn engine:
 Correctly NOT built now — zero data exists yet, nothing to analyze. Capturing the shape so it's
 not re-derived from scratch later.
 
+## Checklist enforcement — how an accepted insight actually becomes a rule, not just prose
+
+**Grounding, flagged honestly**: this section was prompted by a single operator's podcast Q&A
+anecdote (summarized/transcribed 2026-10-12, not a published paper or tested framework) describing
+a "make 100, see what worked, add 2 checklist items, repeat" loop. Treat the general shape as a
+plausible hypothesis worth adapting, not a proven methodology to copy verbatim — same discipline
+as the original two reference videos in Appendix A.
+
+The gap this closes: "5c: tier + author playbook" was previously vague about HOW an accepted
+insight becomes an actual rule — it implied "add a sentence of prose to the rubric and hope Claude
+follows it." This project already has a stronger precedent for exactly this problem: the
+anti-fabrication fix didn't add advisory prose, it added a deterministic `unsupported_claims` check
+that OVERRIDES the model's own judgment. A checklist item is only as good as whether it's actually
+checked, not just suggested — so every accepted insight gets classified by how it's enforced, not
+just pasted into the playbook as another instruction:
+
+- **`eval_check`** — if the insight is mechanically checkable (e.g. "hooks under N words
+  outperform longer ones"), it becomes a new deterministic function in the eval harness
+  (`src/qualume/eval/harness.py`), same pattern as the existing claims gate. Hard pass/fail,
+  never advisory.
+- **`design_constraint`** — if it's structural/layout (e.g. "product visible in first 2 seconds"),
+  it becomes a rule inside the Design engine's template logic directly — Design is already
+  deterministic plain Python, so this is adding a constraint there, never relying on an LLM to
+  remember it at generation time.
+- **`prompt_guidance`** — only genuinely unenforceable, judgment-based insights (tone, vibe,
+  "feels right") fall back to prose in the system prompt. Weakest tier, last resort, not the
+  default.
+
+Each generated checklist item stores `derived_from_insight_id` (traceable back to exactly which
+insight produced it — same provenance discipline as everything else here) and gets its own
+pass-rate tracked after it's added, reusing the before/after measurement pattern already proven
+out on the retry loop (73%→100%, not vibes). An item that always trivially passes may be
+redundant; one that keeps failing either needs a stronger enforcement tier or should be
+reconsidered as not actually true.
+
+**Cap the batch size of new items per playbook version** — the transcript's "next hundred, add two
+points" (not fifty) taken literally: bumping too many checklist items into one playbook version at
+once makes it impossible to isolate which addition actually caused a measured change, the same
+confound-avoidance reasoning already applied to the insight-validity critic itself. A small,
+explicit cap (e.g. 2-3 new enforced items per version bump) keeps each version's effect
+measurable.
+
+## Explore/exploit cycling ("the accordion") — a real policy for an existing unused field
+
+**Grounding, same caveat as above** — this is adapted from the same single podcast anecdote
+("you just keep going back and forth between better and more... it's a very normal cadence"),
+treated as a hypothesis to adapt and test, not copy as proven fact.
+
+`experiments.explore_exploit_ratio` already exists in the schema but nothing currently sets or
+uses it — it's a real field with no real policy behind it yet. The anecdote maps directly onto a
+concrete, implementable rule:
+
+1. **Explore phase** (many cheap variants, lower per-piece effort): default when a focus area
+   (niche/format/segment) has thin `insights_owned` evidence — low `sample_size`, no `accepted`
+   tier yet. Wide `explore_exploit_ratio`, e.g. mostly-explore.
+2. **Exploit phase** (fewer, higher-effort variants refining a winning pattern): triggered once
+   `insights_owned` for that focus area shows strengthening `effect_size`/`sample_size` (i.e. a
+   pattern is emerging, not yet fully proven) — shift the ratio toward exploit, concentrate batch
+   effort on refining that specific pattern rather than spreading thin.
+3. **Reset to explore**: once exploit-phase marginal gains flatten (measured the same way the
+   retry-benefit comparison measured "worth it or not" — before/after numbers, not a guess), shift
+   back toward explore for that focus area. The cycle repeats, not a one-time switch.
+
+Implementation shape: a new function, `determine_explore_exploit_ratio(focus_area) -> float`,
+reads directly off `insights_owned` for that focus area and returns the ratio; `run_batch.py` calls
+it when creating a new `experiments` row instead of a hardcoded/manual value. This is the first
+concrete link between the Learn engine's statistical output and how much volume/effort the Write
+engine actually spends per batch — previously those two sides of the system had no real
+connection.
+
+**Correctly not built now** — needs real `insights_owned` data to have anything to key off of;
+captured here so the policy is designed before the field is ever touched, not invented ad hoc
+later.
+
 ## Build sequencing (depends on, in order)
 
 1. TikTok watchlist actually populated (Part 2, already unblocked — zero accounts today)
@@ -377,7 +451,13 @@ not re-derived from scratch later.
    `grounding_refs` feedback loop, judged against OUR account's own rolling median baseline (not
    raw numbers), so published results accumulate into `insights_owned` and re-validate (or weaken)
    the specific external insights that inspired them — via a real `experiments` row with a stated
-   hypothesis, not an ad hoc one-off check.
+   hypothesis, not an ad hoc one-off check. `determine_explore_exploit_ratio` starts getting real
+   signal to key off of at this point too.
+9. Once `insights_owned`/`insights_external` have `accepted`-tier rows: route each one through
+   the checklist-enforcement classification (`eval_check` / `design_constraint` /
+   `prompt_guidance`) rather than defaulting everything to prose — build the eval-harness/
+   design-engine hooks for the first `eval_check`/`design_constraint` items when they actually
+   exist, not speculatively now.
 
 ## Open questions, not resolved here
 
@@ -423,3 +503,15 @@ not re-derived from scratch later.
   list regardless per explicit user instruction, for a possible separate future project) and
   clarified `ViralLab/SMDT`'s "normalization" means cross-platform schema standardization, not
   account-baseline performance normalization — don't conflate the two.
+- **2026-10-12 (fourth revision)**: added two sections prompted by a single operator podcast Q&A
+  transcript (flagged explicitly as unverified hypothesis, not proven methodology — same
+  discipline as the Appendix A reference videos). (1) Checklist enforcement: accepted insights now
+  get classified by HOW they're enforced (`eval_check` in the eval harness / `design_constraint`
+  in the Design engine / `prompt_guidance` as last-resort prose) instead of all defaulting to
+  playbook prose, each tracked back to `derived_from_insight_id` with its own measured pass rate,
+  capped at a small number of new items per playbook version so effects stay isolated and
+  measurable. (2) Explore/exploit cycling: a real policy (`determine_explore_exploit_ratio`) for
+  the previously-unused `experiments.explore_exploit_ratio` field — wide-explore when
+  `insights_owned` evidence for a focus area is thin, shift to exploit as effect_size/sample_size
+  strengthen, reset to explore once exploit-phase gains measurably flatten. First concrete link
+  between the Learn engine's statistical output and the Write engine's actual batch effort/volume.
