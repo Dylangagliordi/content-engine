@@ -8,7 +8,10 @@ docs/session-context.md). Deliberately kept separate from owned content
 discovery only, never merged into the owned-performance learning signal).
 """
 
+import glob
 import json
+import logging
+import os
 from datetime import datetime, timezone
 
 import yt_dlp
@@ -16,6 +19,13 @@ import yt_dlp
 from qualume.db.connection import get_connection
 
 DEFAULT_MAX_VIDEOS_PER_ACCOUNT = 30
+DEFAULT_RAW_VIDEO_DIR = "data/raw_videos"
+
+# yt-dlp's in-progress / bookkeeping suffixes — a file with one of these is
+# not a finished video and must not satisfy the idempotency check.
+_INCOMPLETE_SUFFIXES = (".part", ".ytdl", ".temp")
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_account_videos(handle: str, max_videos: int = DEFAULT_MAX_VIDEOS_PER_ACCOUNT) -> list[dict]:
@@ -132,3 +142,90 @@ def ingest_videos_for_account(watched_account_id: str, handle: str,
         conn.close()
 
     return {"new_videos": new_videos, "skipped_duplicates": skipped_duplicates}
+
+
+def _existing_video_file(dest_dir: str, platform_video_id: str) -> str | None:
+    """Return the path of an already-downloaded video for this ID, if any."""
+    pattern = os.path.join(glob.escape(dest_dir), f"{glob.escape(platform_video_id)}.*")
+    for path in sorted(glob.glob(pattern)):
+        if os.path.isfile(path) and not path.endswith(_INCOMPLETE_SUFFIXES):
+            return path
+    return None
+
+
+def download_video(url: str, platform_video_id: str, dest_dir: str = DEFAULT_RAW_VIDEO_DIR) -> str:
+    """Download one video's raw file to {dest_dir}/{platform_video_id}.<ext>
+    and return the local path. Idempotent: if a finished file for this ID is
+    already on disk, return it without touching the network."""
+    existing = _existing_video_file(dest_dir, platform_video_id)
+    if existing:
+        return existing
+
+    os.makedirs(dest_dir, exist_ok=True)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": False,
+        "noplaylist": True,
+        "outtmpl": os.path.join(dest_dir, f"{platform_video_id}.%(ext)s"),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        downloads = info.get("requested_downloads") or []
+        path = downloads[0].get("filepath") if downloads else None
+        path = path or ydl.prepare_filename(info)
+
+    # Fail loud rather than recording a path that doesn't exist.
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"yt-dlp reported {path} for {url} but no file was written")
+    return path
+
+
+def download_pending_videos(limit: int | None = None, dest_dir: str = DEFAULT_RAW_VIDEO_DIR,
+                            watched_account_id: str | None = None) -> dict:
+    """Download raw files for external items with no local_video_path yet and
+    record the path. Per-video failures are logged and counted, never fatal —
+    the row stays NULL so the next run retries it. Each successful row is
+    committed immediately so an interrupted run keeps its progress.
+
+    already_had_path counts rows whose file was already on disk (e.g. a prior
+    run downloaded it but died before the DB update) — recorded, not
+    re-downloaded. watched_account_id optionally scopes the run to one account.
+    """
+    counts = {"downloaded": 0, "failed": 0, "already_had_path": 0}
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            query = """SELECT id, url, platform_video_id FROM external_content_items
+                       WHERE local_video_path IS NULL"""
+            params: list = []
+            if watched_account_id is not None:
+                query += " AND watched_account_id = %s"
+                params.append(watched_account_id)
+            query += " ORDER BY discovered_at, id"
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+            cur.execute(query, params)
+            pending = cur.fetchall()
+
+            for item_id, url, platform_video_id in pending:
+                try:
+                    already_on_disk = _existing_video_file(dest_dir, platform_video_id) is not None
+                    path = download_video(url, platform_video_id, dest_dir=dest_dir)
+                    cur.execute(
+                        "UPDATE external_content_items SET local_video_path = %s WHERE id = %s",
+                        (path, item_id),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    logger.exception("Failed to download video %s (%s)", platform_video_id, url)
+                    counts["failed"] += 1
+                    continue
+                counts["already_had_path" if already_on_disk else "downloaded"] += 1
+    finally:
+        conn.close()
+
+    return counts

@@ -5,3 +5,4 @@ __pycache__/
 data/*.db
 data/assets/
 data/eval_logs/
+data/raw_videos/
