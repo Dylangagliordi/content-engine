@@ -3,20 +3,27 @@
 Gemini is a deliberate, scoped exception to the Claude-only rule: it is used
 ONLY here, for native audio+video understanding (see
 plans/learn-engine-idea-sourcing-architecture.md, "How AI actually watches a
-video"). Computed signals (pacing_cuts_per_min, music_mood) are a separate,
-future job and are never asked of Gemini.
+video"). Since v2, every signal — including music mood and pacing — comes
+from this one call; there is no separate signal-processing job. Pacing is
+qualitative only (Gemini samples video at 1 FPS, so exact cut counts are
+unreliable).
 """
+import json
 import os
 import time
+from typing import NamedTuple
 
 from google import genai
 from google.genai import types
+from pydantic import ValidationError
 
 from qualume import config  # noqa: F401 — loads .env into os.environ
 from qualume.db.connection import get_connection
-from qualume.models.contracts import ExternalVideoAnnotation
+from psycopg2.extras import Json
 
-ANALYSIS_PROMPT_VERSION = "v1"
+from qualume.models.contracts import ExternalVideoAnnotationV2
+
+ANALYSIS_PROMPT_VERSION = "v2"
 
 # gemini-3.8-flash is the newest/most capable and real on this key, but is
 # returning persistent 503 ServerError specifically on video input as of
@@ -65,7 +72,36 @@ speech, movement, editing and music together:
 - tone_category: the single dominant tone, from the allowed values only.
 - voice_delivery_style: how the voice is delivered (e.g. conversational \
 direct-to-camera, whispered ASMR, fast-talking hype, text-to-speech, no voice).
+
+Timestamped fields. All times are seconds from the start of the video \
+(decimals allowed); every list must be in chronological order.
+- script_structure_timeline: the same beats as script_structure_tags, each \
+with start_sec and end_sec, covering the video from start to end.
+- on_screen_text: every distinct piece of text shown on screen (captions, \
+titles, overlays, stickers, labels), transcribed verbatim, each with the \
+timestamp_sec it first appears. Do not include spoken words that are not \
+shown as text. Empty list if there is no on-screen text.
+- emotion_timeline: how the emotion of the video shifts over time, judged \
+from facial expression, voice and music together. One entry at 0, then one \
+for each noticeable shift, as a single lowercase word (e.g. curious, \
+frustrated, surprised, relieved, excited, calm, nostalgic). A video with one \
+steady emotion has a single entry.
+- pacing_qualitative: the overall editing and visual pace — slow, medium or \
+fast. Give a qualitative read, do not try to count cuts.
+- pacing_rationale: one sentence on what you observed that justifies the \
+pacing read (e.g. shot length, camera movement, speech speed).
+- music_mood: mood tags for the music, from listening to the audio, lowercase \
+(e.g. upbeat, melancholic, suspenseful, dreamy, aggressive, lofi). Empty list \
+if there is no music.
 """
+
+
+class AnnotationResult(NamedTuple):
+    annotation: ExternalVideoAnnotationV2 | None  # None if schema validation failed
+    raw_response: dict  # complete parsed Gemini response, including unmapped keys —
+                         # ALWAYS populated when Gemini returned anything parseable,
+                         # even if `annotation` is None. Nothing gets silently dropped.
+    validation_error: str | None = None  # set when annotation is None, explains why
 
 
 def _gemini_client() -> genai.Client:
@@ -95,8 +131,9 @@ def _wait_until_active(client: genai.Client, uploaded):
     return file
 
 
-def annotate_video(local_video_path: str) -> ExternalVideoAnnotation:
-    """Upload one video to Gemini, have it watch it, return validated DNA."""
+def annotate_video(local_video_path: str) -> AnnotationResult:
+    """Upload one video to Gemini, have it watch it, return validated DNA
+    alongside the complete raw response."""
     if not os.path.isfile(local_video_path):
         raise FileNotFoundError(f"Video file not found: {local_video_path}")
     client = _gemini_client()
@@ -109,14 +146,29 @@ def annotate_video(local_video_path: str) -> ExternalVideoAnnotation:
             contents=[video, ANNOTATION_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotation,
+                response_schema=ExternalVideoAnnotationV2,
             ),
         )
         # Validate the raw text ourselves: the SDK's response.parsed silently
         # becomes None on a validation failure instead of raising.
         if not response.text:
             raise RuntimeError(f"Gemini returned no text for {local_video_path}")
-        return ExternalVideoAnnotation.model_validate_json(response.text)
+        raw_response = json.loads(response.text)
+        if not isinstance(raw_response, dict):
+            raise RuntimeError(
+                f"Gemini response for {local_video_path} is not a JSON object: {response.text[:200]}"
+            )
+        try:
+            annotation = ExternalVideoAnnotationV2.model_validate(raw_response)
+            return AnnotationResult(annotation=annotation, raw_response=raw_response)
+        except ValidationError as e:
+            # Don't lose the raw response just because our strict schema (e.g.
+            # chronological-order checks) rejected it — row 5 above. Capture
+            # what Gemini actually said; annotate_and_store decides how to
+            # store a row even when typed-field validation failed.
+            return AnnotationResult(
+                annotation=None, raw_response=raw_response, validation_error=str(e)
+            )
     finally:
         # Uploaded files auto-expire after ~48h; delete now to not leave them around.
         client.files.delete(name=uploaded.name)
@@ -124,7 +176,14 @@ def annotate_video(local_video_path: str) -> ExternalVideoAnnotation:
 
 def annotate_and_store(external_content_item_id: str) -> str:
     """Annotate one external_content_items row's video; insert and return the
-    new external_creative_dna row id."""
+    new external_creative_dna row id.
+
+    If Gemini's output fails our strict schema validation (e.g. an
+    out-of-order timestamp), the row is still saved: raw_gemini_response
+    and validation_error are populated, every typed field we can pull
+    straight out of the raw dict (best-effort, no re-validation) is filled,
+    and anything we genuinely can't trust stays NULL. Nothing is silently
+    discarded just because one field didn't fit the strict model."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -142,7 +201,44 @@ def annotate_and_store(external_content_item_id: str) -> str:
                 "download the video first (tiktok_reader.download_pending_videos)"
             )
 
-        ann = annotate_video(local_video_path)
+        result = annotate_video(local_video_path)
+        ann, raw_response, validation_error = (
+            result.annotation, result.raw_response, result.validation_error
+        )
+
+        if ann is not None:
+            # Clean path: fully validated against the strict schema.
+            values = dict(
+                hook_type=ann.hook_type, hook_text=ann.hook_text,
+                visual_hook_description=ann.visual_hook_description, format_tag=ann.format_tag,
+                script_structure_tags=ann.script_structure_tags, cta_type=ann.cta_type,
+                caption_style=ann.caption_style, social_proof_used=ann.social_proof_used,
+                energy_level=ann.energy_level, tone_category=ann.tone_category,
+                voice_delivery_style=ann.voice_delivery_style,
+                script_structure_timeline=Json([b.model_dump() for b in ann.script_structure_timeline]),
+                on_screen_text=Json([t.model_dump() for t in ann.on_screen_text]),
+                emotion_timeline=Json([e.model_dump() for e in ann.emotion_timeline]),
+                pacing_qualitative=ann.pacing_qualitative, music_mood_v2=ann.music_mood,
+            )
+        else:
+            # Validation failed — pull what we safely can straight from the raw
+            # dict (no re-validation, best-effort scalars only; nested/typed
+            # fields that caused the failure are left NULL rather than guessed).
+            def _raw(key, default=None):
+                return raw_response.get(key, default)
+
+            values = dict(
+                hook_type=_raw("hook_type"), hook_text=_raw("hook_text"),
+                visual_hook_description=_raw("visual_hook_description"),
+                format_tag=_raw("format_tag"),
+                script_structure_tags=_raw("script_structure_tags") or [],
+                cta_type=_raw("cta_type"), caption_style=_raw("caption_style"),
+                social_proof_used=bool(_raw("social_proof_used", False)),
+                energy_level=_raw("energy_level"), tone_category=_raw("tone_category"),
+                voice_delivery_style=_raw("voice_delivery_style"),
+                script_structure_timeline=None, on_screen_text=None, emotion_timeline=None,
+                pacing_qualitative=_raw("pacing_qualitative"), music_mood_v2=_raw("music_mood"),
+            )
 
         with conn.cursor() as cur:
             cur.execute(
@@ -150,14 +246,21 @@ def annotate_and_store(external_content_item_id: str) -> str:
                        (external_content_item_id, hook_type, hook_text, visual_hook_description,
                         format_tag, script_structure_tags, cta_type, caption_style,
                         social_proof_used, energy_level, tone_category, voice_delivery_style,
+                        script_structure_timeline, on_screen_text, emotion_timeline,
+                        pacing_qualitative, music_mood_v2, raw_gemini_response, validation_error,
                         analysis_model, analysis_prompt_version)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (
-                    external_content_item_id, ann.hook_type, ann.hook_text,
-                    ann.visual_hook_description, ann.format_tag, ann.script_structure_tags,
-                    ann.cta_type, ann.caption_style, ann.social_proof_used, ann.energy_level,
-                    ann.tone_category, ann.voice_delivery_style,
+                    external_content_item_id, values["hook_type"], values["hook_text"],
+                    values["visual_hook_description"], values["format_tag"],
+                    values["script_structure_tags"], values["cta_type"], values["caption_style"],
+                    values["social_proof_used"], values["energy_level"], values["tone_category"],
+                    values["voice_delivery_style"], values["script_structure_timeline"],
+                    values["on_screen_text"], values["emotion_timeline"],
+                    values["pacing_qualitative"], values["music_mood_v2"],
+                    Json(raw_response), validation_error,
                     GEMINI_MODEL, ANALYSIS_PROMPT_VERSION,
                 ),
             )

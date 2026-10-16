@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RawContentRecord(BaseModel):
@@ -37,8 +37,8 @@ ToneCategory = Literal[
 class ExternalVideoAnnotation(BaseModel):
     """Model-observed signals for one external video — the structured output
     Gemini is constrained to (response_schema). Becomes part of an
-    external_creative_dna row. Deliberately excludes pacing_cuts_per_min and
-    music_mood: those are computed from the signal, never LLM-guessed."""
+    external_creative_dna row. v1 (analysis_prompt_version='v1'); kept for
+    existing rows/callers — new annotations use ExternalVideoAnnotationV2."""
     hook_type: str = Field(description="Hook mechanism in the first ~3s, snake_case, e.g. question, bold_claim, problem_statement, visual_reveal, pattern_interrupt")
     hook_text: str = Field(description="Exact words spoken or shown on screen in the hook; empty string if none")
     visual_hook_description: str = Field(description="What is visually on screen during the first ~3s")
@@ -50,6 +50,56 @@ class ExternalVideoAnnotation(BaseModel):
     energy_level: int = Field(ge=1, le=5, description="1=calm/meditative, 2=relaxed, 3=moderate/conversational, 4=upbeat/lively, 5=maximum intensity/frenetic")
     tone_category: ToneCategory = Field(description="Single dominant tone")
     voice_delivery_style: str = Field(description="How the voice is delivered, e.g. conversational direct-to-camera, whispered ASMR, fast-talking hype, text-to-speech, no voice")
+
+
+class ScriptBeat(BaseModel):
+    beat: str = Field(description="Beat name, snake_case, e.g. hook, problem, demo, payoff, cta")
+    start_sec: float = Field(ge=0, description="Beat start, seconds from video start")
+    end_sec: float = Field(ge=0, description="Beat end, seconds from video start")
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self):
+        if self.end_sec < self.start_sec:
+            raise ValueError(f"beat {self.beat!r} ends ({self.end_sec}) before it starts ({self.start_sec})")
+        return self
+
+
+class OnScreenText(BaseModel):
+    text: str = Field(description="Literal on-screen text/caption/overlay, verbatim")
+    timestamp_sec: float = Field(ge=0, description="When the text first appears, seconds from video start")
+
+
+class EmotionPoint(BaseModel):
+    timestamp_sec: float = Field(ge=0, description="When this emotion begins, seconds from video start")
+    emotion: str = Field(description="Dominant emotion from this point on, one lowercase word, e.g. curious, frustrated, relieved, excited, calm")
+
+
+PacingQualitative = Literal["slow", "medium", "fast"]
+
+
+def _require_non_decreasing(values: list[float], field: str) -> None:
+    if any(b < a for a, b in zip(values, values[1:])):
+        raise ValueError(f"{field} must be in chronological order, got timestamps {values}")
+
+
+class ExternalVideoAnnotationV2(ExternalVideoAnnotation):
+    """v2 adds timestamped structure and audio-derived signals, all asked of
+    Gemini in the same call (no separate PySceneDetect/beatlyze job). Pacing
+    is qualitative only: Gemini samples video at 1 FPS, so a precise
+    cuts-per-minute count is structurally unreliable and is never asked for."""
+    script_structure_timeline: list[ScriptBeat] = Field(description="Ordered beats of the video with start/end seconds")
+    on_screen_text: list[OnScreenText] = Field(description="Every distinct piece of on-screen text, in order of appearance; empty if none")
+    emotion_timeline: list[EmotionPoint] = Field(description="Emotional shifts across the video, in chronological order, starting at 0")
+    pacing_qualitative: PacingQualitative = Field(description="Overall editing/visual pace: slow, medium, or fast")
+    pacing_rationale: str = Field(description="One sentence justifying the pacing read from what is observable")
+    music_mood: list[str] = Field(description="Mood tags for the music, from the audio, lowercase, e.g. upbeat, melancholic, suspenseful, lofi; empty if no music")
+
+    @model_validator(mode="after")
+    def _timelines_in_order(self):
+        _require_non_decreasing([b.start_sec for b in self.script_structure_timeline], "script_structure_timeline")
+        _require_non_decreasing([t.timestamp_sec for t in self.on_screen_text], "on_screen_text")
+        _require_non_decreasing([e.timestamp_sec for e in self.emotion_timeline], "emotion_timeline")
+        return self
 
 
 class CampaignBrief(BaseModel):
