@@ -18,11 +18,15 @@ from qualume.models.contracts import ExternalVideoAnnotation
 
 ANALYSIS_PROMPT_VERSION = "v1"
 
-# Taken from the model list shipped in google-genai 2.31.0 (described there as
-# the current most capable Flash model). NOT yet verified against the live API
-# because no key was configured at build time — verify before the first real run:
-#   uv run python -c "from google import genai; import os; print([m.name for m in genai.Client(api_key=os.environ['GEMINI_API_KEY']).models.list()])"
-GEMINI_MODEL = "gemini-3.8-flash"
+# gemini-3.8-flash is the newest/most capable and real on this key, but is
+# returning persistent 503 ServerError specifically on video input as of
+# 2026-10-15 (plain text succeeds on it; video fails identically across
+# 3.8-flash, flash-latest, AND 3.7-flash — isolated via direct testing, not
+# assumed). gemini-3.1-flash-lite verified live: uploads, polls ACTIVE, and
+# returns an accurate video description. Using it until 3.8-flash's video path
+# stabilizes — re-check periodically, same re-verify command pattern as before:
+#   uv run python -c "from google import genai; import os; from dotenv import load_dotenv; load_dotenv(); print(genai.Client(api_key=os.environ['GEMINI_API_KEY']).models.get(model='models/gemini-3.8-flash'))"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 FILE_POLL_INTERVAL_SECONDS = 2
 FILE_POLL_TIMEOUT_SECONDS = 300
