@@ -11,7 +11,12 @@ transcript, aiming for enough structured detail that a new video could be
 briefed as stylistically/structurally equivalent — not just a similar hook.
 v4 stops storing Gemini's independent hook_text/visual_hook_description
 (derived in Python from the transcript/shots instead — see
-derive_hook_fields) and makes per-shot color/setting queryable.
+derive_hook_fields) and makes per-shot color/setting queryable. v5 rejects
+under-segmented transcripts/shots (contract validators) and records
+coverage gaps against the real video duration. Temperature is left at the
+API default — Google's own Gemini 3 guidance (confirmed live,
+ai.google.dev/gemini-api/docs/gemini-3) warns lower values risk looping/
+degraded output on Gemini 3 models, which GEMINI_MODEL is.
 """
 import json
 import os
@@ -27,13 +32,15 @@ from qualume.db.connection import get_connection
 from psycopg2.extras import Json
 
 from qualume.models.contracts import (
-    ExternalVideoAnnotationV4,
+    ExternalVideoAnnotationV5,
+    MAX_SHOT_SECONDS,
+    MAX_TRANSCRIPT_SEGMENT_SECONDS,
     ScriptBeat,
     ShotBreakdownV4,
     TranscriptSegment,
 )
 
-ANALYSIS_PROMPT_VERSION = "v4"
+ANALYSIS_PROMPT_VERSION = "v5"
 
 # gemini-3.8-flash is the newest/most capable and real on this key, but is
 # returning persistent 503 ServerError specifically on video input as of
@@ -45,9 +52,34 @@ ANALYSIS_PROMPT_VERSION = "v4"
 #   uv run python -c "from google import genai; import os; from dotenv import load_dotenv; load_dotenv(); print(genai.Client(api_key=os.environ['GEMINI_API_KEY']).models.get(model='models/gemini-3.8-flash'))"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
+# A single generate_content call has no cross-call state; the only lever for
+# run-to-run consistency on the same video is sampling variance. Gemini's API
+# accepts 0.0 (range 0.0-2.0, and the SDK field is a plain Optional[float], so
+# 0.0 isn't dropped as falsy), so near-zero is not about an SDK edge case — 0.1
+# CONFIRMED (checked live against Google's own docs, ai.google.dev/
+# gemini-api/docs/gemini-3, 2026-10-16): for ALL Gemini 3 models, Google
+# "strongly recommends keeping temperature at its default value of 1.0" —
+# lower values are documented to risk looping/degraded output, specifically
+# on Gemini 3 models. GEMINI_MODEL (gemini-3.1-flash-lite) IS a Gemini 3
+# model, so a low temperature here would likely make output WORSE, not more
+# consistent — the opposite of FIX 2's original intent. Do not set a
+# temperature override; let the SDK default (1.0) apply. If GEMINI_MODEL
+# ever changes to a non-Gemini-3 model, this guidance may no longer apply —
+# re-check before reintroducing a temperature override.
+GEMINI_TEMPERATURE = None  # None = use the SDK/API default, not a override
+
+# Unaccounted-for stretch of the real video (between/around shots) that gets
+# flagged in coverage_warning. Small gaps are normal Gemini timestamp slop.
+MAX_COVERAGE_GAP_SECONDS = 3.0
+
 FILE_POLL_INTERVAL_SECONDS = 2
 FILE_POLL_TIMEOUT_SECONDS = 300
 
+# v5's segmentation wording (shot_breakdown / full_transcript) is a nudge, not
+# a guarantee — v4 already asked for "every" shot/utterance and still got one
+# collapsed segment. ExternalVideoAnnotationV5's validators are the real
+# backstop; the 10s / 8s figures below mirror MAX_SHOT_SECONDS /
+# MAX_TRANSCRIPT_SEGMENT_SECONDS — keep them in sync.
 ANNOTATION_PROMPT = """\
 You are annotating a short-form social video (TikTok) for a content-pattern \
 research database. Watch the whole video, using BOTH the visuals and the audio \
@@ -108,8 +140,13 @@ if there is no music.
 Shot-level and transcript fields. These are the most granular fields — the \
 goal is enough detail that someone could brief a NEW video with the same \
 visual style and structure without rewatching this one.
-- shot_breakdown: every distinct camera shot/setup, in chronological order, \
-covering the whole video start to end (no gaps). For each shot give: \
+- shot_breakdown: one entry PER CAMERA CUT, in chronological order, covering \
+the whole video start to end (no gaps). Every time the picture cuts to a new \
+shot, angle, framing or setting, start a new entry — even if the setting is \
+the same and the cut is only a second long. Do NOT merge several cuts into \
+one entry. No single shot entry may last longer than 10 seconds; if one \
+continuous take really is longer, split it at a change in framing or action. \
+For each shot give: \
 start_sec, end_sec, shot_type (e.g. close_up, medium_shot, wide_shot, \
 extreme_close_up, pov), camera_movement (e.g. static, handheld, pan, \
 zoom_in, zoom_out, tracking), setting (where it takes place, e.g. kitchen, \
@@ -123,10 +160,14 @@ backlit, studio, golden_hour), and subject_action (what the person/subject \
 is doing, one short phrase). A beat from \
 script_structure_timeline can span multiple shots if the camera setup \
 changes within it.
-- full_transcript: every spoken utterance in the video, in chronological \
-order, transcribed verbatim, each with the start_sec it begins. This is the \
-COMPLETE transcript, not just the hook — include everything said, not only \
-the opening few seconds. Empty list if there is no speech.
+- full_transcript: the spoken words, in chronological order, transcribed \
+verbatim, as ONE ENTRY PER SENTENCE (or per short phrase if the speaker \
+doesn't use full sentences), each with the start_sec that sentence begins. \
+Do NOT merge multiple sentences into one entry, and never return the whole \
+transcript as a single entry. No entry may cover more than 8 seconds \
+of the video. A typical 30-second talking video has roughly 6-12 entries. \
+This is the COMPLETE transcript, not just the hook — include everything said, \
+through to the end of the video. Empty list if there is no speech.
 """
 
 
@@ -148,6 +189,33 @@ def _shot_phrase(shot: ShotBreakdownV4) -> str:
     kind = shot.shot_type.replace("_", " ").strip().removesuffix(" shot")
     article = "An" if kind[:1].lower() in "aeiou" else "A"
     return f"{article} {kind} shot"
+
+
+def _shots_granularity_ok(shots: list[ShotBreakdownV4]) -> bool:
+    """Same per-shot span check as ExternalVideoAnnotationV5._v5_granularity,
+    reused on the degraded path so a raw shot list that would fail the full
+    contract's validator (but parses fine item-by-item) doesn't still get
+    derived into visual_hook_description — see the comment at its call site
+    in annotate_and_store for why this matters."""
+    return all(s.end_sec - s.start_sec <= MAX_SHOT_SECONDS for s in shots)
+
+
+def _transcript_granularity_ok(
+    transcript: list[TranscriptSegment],
+    timeline: list[ScriptBeat],
+    shots: list[ShotBreakdownV4] | None,
+) -> bool:
+    """Same per-segment span check as ExternalVideoAnnotationV5._v5_granularity
+    (mirrors its bounds logic: the last segment's end is the latest known
+    shot/beat end_sec), reused on the degraded path for the same reason as
+    _shots_granularity_ok above."""
+    starts = sorted(t.start_sec for t in transcript)
+    ends = [b.end_sec for b in timeline] + [s.end_sec for s in (shots or [])]
+    bounds = starts[1:] + ([max(ends)] if ends else [])
+    return all(
+        next_start - start <= MAX_TRANSCRIPT_SEGMENT_SECONDS
+        for start, next_start in zip(starts, bounds)
+    )
 
 
 def derive_hook_fields(
@@ -193,6 +261,51 @@ def derive_hook_fields(
     return hook_text, visual
 
 
+def _check_coverage(
+    annotation: ExternalVideoAnnotationV5, video_duration_seconds: float | None
+) -> list[str]:
+    """Return human-readable warnings for a schema-valid annotation that
+    doesn't actually cover the real video (empty list = looks complete).
+
+    Deliberately warnings, not a ValidationError: the contract's validators
+    only see Gemini's own timestamps, so they can't tell that shots ending
+    at 10s are wrong for a 32s video — but the shots/transcript that ARE
+    there are still valid data worth keeping. Stored in coverage_warning
+    so incomplete rows stay queryable after the fact."""
+    if video_duration_seconds is None:
+        return ["video duration unknown (external_content_items.duration_seconds is NULL); coverage not checked"]
+    duration = float(video_duration_seconds)
+    warnings = []
+
+    shots = sorted(annotation.shot_breakdown, key=lambda s: s.start_sec)
+    if not shots:
+        warnings.append(f"shot_breakdown is empty for a {duration:g}s video")
+    covered_until = 0.0
+    for shot in shots:
+        if shot.start_sec - covered_until > MAX_COVERAGE_GAP_SECONDS:
+            warnings.append(
+                f"shot_breakdown has a {shot.start_sec - covered_until:.1f}s gap "
+                f"({covered_until}-{shot.start_sec}s) with no shot"
+            )
+        covered_until = max(covered_until, shot.end_sec)
+    if shots and duration - covered_until > MAX_COVERAGE_GAP_SECONDS:
+        warnings.append(f"shot_breakdown stops at {covered_until}s of a {duration:g}s video")
+    if covered_until - duration > MAX_COVERAGE_GAP_SECONDS:
+        warnings.append(f"shot_breakdown runs to {covered_until}s, past the real {duration:g}s video end")
+
+    # Empty transcript is legitimate (silent video), so only a non-empty one
+    # that stops early is flagged — same ceiling the contract uses between
+    # segments, now measured against the real end instead of Gemini's own.
+    if annotation.full_transcript:
+        last = max(t.start_sec for t in annotation.full_transcript)
+        if duration - last > MAX_TRANSCRIPT_SEGMENT_SECONDS:
+            warnings.append(
+                f"full_transcript's last segment starts at {last}s of a {duration:g}s video "
+                f"({duration - last:.1f}s with no new segment)"
+            )
+    return warnings
+
+
 _M = TypeVar("_M", bound=BaseModel)
 
 
@@ -208,11 +321,13 @@ def _parse_raw_list(model: type[_M], items) -> list[_M] | None:
 
 
 class AnnotationResult(NamedTuple):
-    annotation: ExternalVideoAnnotationV4 | None  # None if schema validation failed
+    annotation: ExternalVideoAnnotationV5 | None  # None if schema validation failed
     raw_response: dict  # complete parsed Gemini response, including unmapped keys —
                          # ALWAYS populated when Gemini returned anything parseable,
                          # even if `annotation` is None. Nothing gets silently dropped.
     validation_error: str | None = None  # set when annotation is None, explains why
+    coverage_warning: str | None = None  # "; "-joined _check_coverage warnings for a
+                                          # VALID annotation; None if complete or invalid
 
 
 def _gemini_client() -> genai.Client:
@@ -242,9 +357,11 @@ def _wait_until_active(client: genai.Client, uploaded):
     return file
 
 
-def annotate_video(local_video_path: str) -> AnnotationResult:
+def annotate_video(local_video_path: str, video_duration_seconds: float | None) -> AnnotationResult:
     """Upload one video to Gemini, have it watch it, return validated DNA
-    alongside the complete raw response."""
+    alongside the complete raw response. video_duration_seconds is the real
+    duration (yt-dlp metadata), passed in rather than looked up so this
+    stays DB-free; it's only used for the coverage check."""
     if not os.path.isfile(local_video_path):
         raise FileNotFoundError(f"Video file not found: {local_video_path}")
     client = _gemini_client()
@@ -257,7 +374,8 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
             contents=[video, ANNOTATION_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotationV4,
+                response_schema=ExternalVideoAnnotationV5,
+                temperature=GEMINI_TEMPERATURE,
             ),
         )
         # Validate the raw text ourselves: the SDK's response.parsed silently
@@ -270,8 +388,7 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
                 f"Gemini response for {local_video_path} is not a JSON object: {response.text[:200]}"
             )
         try:
-            annotation = ExternalVideoAnnotationV4.model_validate(raw_response)
-            return AnnotationResult(annotation=annotation, raw_response=raw_response)
+            annotation = ExternalVideoAnnotationV5.model_validate(raw_response)
         except ValidationError as e:
             # Don't lose the raw response just because our strict schema (e.g.
             # chronological-order checks) rejected it — row 5 above. Capture
@@ -280,6 +397,11 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
             return AnnotationResult(
                 annotation=None, raw_response=raw_response, validation_error=str(e)
             )
+        warnings = _check_coverage(annotation, video_duration_seconds)
+        return AnnotationResult(
+            annotation=annotation, raw_response=raw_response,
+            coverage_warning="; ".join(warnings) or None,
+        )
     finally:
         # Uploaded files auto-expire after ~48h; delete now to not leave them around.
         client.files.delete(name=uploaded.name)
@@ -298,27 +420,32 @@ def annotate_and_store(external_content_item_id: str) -> str:
 
     hook_text / visual_hook_description are ALWAYS the derive_hook_fields
     values, never Gemini's independent answers (those stay only in
-    raw_gemini_response)."""
+    raw_gemini_response).
+
+    coverage_warning is set when a VALID annotation doesn't span the real
+    video duration (see _check_coverage); NULL on the degraded path, where
+    validation_error already says what's wrong."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT local_video_path FROM external_content_items WHERE id = %s",
+                "SELECT local_video_path, duration_seconds FROM external_content_items WHERE id = %s",
                 (external_content_item_id,),
             )
             row = cur.fetchone()
         if row is None:
             raise ValueError(f"external_content_items row {external_content_item_id} not found")
-        local_video_path = row[0]
+        local_video_path, duration_seconds = row
         if local_video_path is None:
             raise ValueError(
                 f"external_content_items row {external_content_item_id} has NULL local_video_path — "
                 "download the video first (tiktok_reader.download_pending_videos)"
             )
 
-        result = annotate_video(local_video_path)
-        ann, raw_response, validation_error = (
-            result.annotation, result.raw_response, result.validation_error
+        result = annotate_video(local_video_path, duration_seconds)
+        ann, raw_response, validation_error, coverage_warning = (
+            result.annotation, result.raw_response, result.validation_error,
+            result.coverage_warning,
         )
 
         if ann is not None:
@@ -348,17 +475,23 @@ def annotate_and_store(external_content_item_id: str) -> str:
             def _raw(key, default=None):
                 return raw_response.get(key, default)
 
-            # Derive the hook fields best-effort from the raw lists. A bad
-            # timeline just means the 3s fallback window; an unusable
-            # transcript/shots means NULL — never Gemini's independent
-            # hook_text, which would reintroduce the second source of truth.
+            # Derive the hook fields best-effort from the raw lists — but
+            # only if those lists individually pass the SAME granularity
+            # ceilings ExternalVideoAnnotationV5 enforces. Otherwise a
+            # structurally-valid-per-item but under-segmented list (e.g. the
+            # real bug: one TranscriptSegment spanning the whole 32s video —
+            # each item is individually valid, only the list-level span
+            # check rejects it) would still get derived into a bad hook_text
+            # on the degraded path, silently reintroducing the exact issue
+            # v5's validator exists to catch. NULL is correct here — the
+            # row's validation_error already explains why.
             timeline = _parse_raw_list(ScriptBeat, _raw("script_structure_timeline")) or []
             transcript = _parse_raw_list(TranscriptSegment, _raw("full_transcript"))
             shots = _parse_raw_list(ShotBreakdownV4, _raw("shot_breakdown"))
             hook_text = visual_hook_description = None
-            if transcript is not None:
+            if transcript is not None and _transcript_granularity_ok(transcript, timeline, shots):
                 hook_text = derive_hook_fields(timeline, transcript, [])[0]
-            if shots is not None:
+            if shots is not None and _shots_granularity_ok(shots):
                 visual_hook_description = derive_hook_fields(timeline, [], shots)[1]
 
             values = dict(
@@ -383,10 +516,10 @@ def annotate_and_store(external_content_item_id: str) -> str:
                         social_proof_used, energy_level, tone_category, voice_delivery_style,
                         script_structure_timeline, on_screen_text, emotion_timeline,
                         pacing_qualitative, music_mood_v2, shot_breakdown, full_transcript,
-                        raw_gemini_response, validation_error,
+                        raw_gemini_response, validation_error, coverage_warning,
                         analysis_model, analysis_prompt_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (
                     external_content_item_id, values["hook_type"], values["hook_text"],
@@ -397,7 +530,7 @@ def annotate_and_store(external_content_item_id: str) -> str:
                     values["on_screen_text"], values["emotion_timeline"],
                     values["pacing_qualitative"], values["music_mood_v2"],
                     values["shot_breakdown"], values["full_transcript"],
-                    Json(raw_response), validation_error,
+                    Json(raw_response), validation_error, coverage_warning,
                     GEMINI_MODEL, ANALYSIS_PROMPT_VERSION,
                 ),
             )

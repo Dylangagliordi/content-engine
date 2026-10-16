@@ -11,6 +11,9 @@ from qualume.models.contracts import (
     ExternalVideoAnnotationV2,
     ExternalVideoAnnotationV3,
     ExternalVideoAnnotationV4,
+    ExternalVideoAnnotationV5,
+    MAX_SHOT_SECONDS,
+    MAX_TRANSCRIPT_SEGMENT_SECONDS,
     ScriptBeat,
     ShotBreakdown,
     ShotBreakdownV4,
@@ -21,6 +24,9 @@ from qualume.annotate.gemini_watcher import (
     ANALYSIS_PROMPT_VERSION,
     ANNOTATION_PROMPT,
     GEMINI_MODEL,
+    GEMINI_TEMPERATURE,
+    MAX_COVERAGE_GAP_SECONDS,
+    _check_coverage,
     annotate_video,
     annotate_and_store,
     derive_hook_fields,
@@ -115,6 +121,31 @@ def _good_v4_dict(**overrides):
         full_transcript=[
             {"start_sec": 0.0, "text": "Why does nobody talk about this?"},
             {"start_sec": 3.0, "text": "Let me show you exactly how it works."},
+        ],
+    )
+    data.update(overrides)
+    return data
+
+
+V5_VIDEO_DURATION = 17  # matches _good_v5_dict's timeline end
+
+
+def _good_v5_dict(**overrides):
+    # v5's shape is v4's, but finely segmented enough to pass v5's
+    # granularity ceilings (v4's fixture has an 11.5s shot and 14s of
+    # trailing transcript, both of which v5 deliberately rejects).
+    data = _good_v2_dict(
+        shot_breakdown=[
+            _shot(0.0, 2.5, subject_action="opening a jar"),
+            _shot(2.5, 9.0, camera_movement="handheld", subject_action="demonstrating the product"),
+            _shot(9.0, 14.0, shot_type="medium_shot", subject_action="showing the result"),
+            _shot(14.0, 17.0, subject_action="pointing at follow button"),
+        ],
+        full_transcript=[
+            {"start_sec": 0.0, "text": "Why does nobody talk about this?"},
+            {"start_sec": 3.0, "text": "Let me show you exactly how it works."},
+            {"start_sec": 7.5, "text": "You just twist and press."},
+            {"start_sec": 12.0, "text": "Follow for part two."},
         ],
     )
     data.update(overrides)
@@ -359,6 +390,152 @@ def test_prompt_describes_v4_shot_fields_and_their_vocabularies():
         assert word in ANNOTATION_PROMPT, f"ANNOTATION_PROMPT never mentions {word}"
 
 
+# --- Contract v5 -------------------------------------------------------------
+
+
+def _real_bug_32s_dict():
+    """The real v4 run: shots/beats correctly cover a 32s video, but
+    full_transcript collapsed into ONE segment at 0.0 covering everything —
+    so derive_hook_fields attributed the whole script to the hook."""
+    return _good_v5_dict(
+        script_structure_timeline=[
+            {"beat": "hook", "start_sec": 0.0, "end_sec": 3.0},
+            {"beat": "demo", "start_sec": 3.0, "end_sec": 26.0},
+            {"beat": "cta", "start_sec": 26.0, "end_sec": 32.0},
+        ],
+        shot_breakdown=[_shot(float(s), float(s + 4)) for s in range(0, 32, 4)],
+        full_transcript=[{"start_sec": 0.0, "text": "Sentence one. Sentence two. ... Sentence eight."}],
+    )
+
+
+def test_v5_rejects_one_transcript_segment_spanning_the_whole_video():
+    """Exact reproduction of the real v4 bug."""
+    raw = _real_bug_32s_dict()
+    ExternalVideoAnnotationV4(**raw)  # v4 accepted it — that's the bug
+    with pytest.raises(ValidationError, match="full_transcript"):
+        ExternalVideoAnnotationV5(**raw)
+
+
+def test_v5_rejects_an_overlong_transcript_segment_in_the_middle():
+    raw = _good_v5_dict(full_transcript=[
+        {"start_sec": 0.0, "text": "a"},
+        {"start_sec": 2.0, "text": "b — then nothing until 11.5"},  # spans 9.5s
+        {"start_sec": 11.5, "text": "c"},
+    ])
+    with pytest.raises(ValidationError, match="full_transcript"):
+        ExternalVideoAnnotationV5(**raw)
+
+
+def test_v5_accepts_transcript_segments_all_under_the_ceiling():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict())
+    assert len(ann.full_transcript) == 4
+
+
+def test_v5_transcript_ceiling_is_inclusive():
+    # last segment at 9.0, annotation ends at 17.0 -> exactly the ceiling
+    assert MAX_TRANSCRIPT_SEGMENT_SECONDS == 8.0
+    raw = _good_v5_dict(full_transcript=[
+        {"start_sec": 0.0, "text": "a"}, {"start_sec": 5.0, "text": "b"},
+        {"start_sec": 9.0, "text": "c"},
+    ])
+    ExternalVideoAnnotationV5(**raw)
+
+
+def test_v5_allows_empty_transcript():
+    """A silent video legitimately has no speech."""
+    assert ExternalVideoAnnotationV5(**_good_v5_dict(full_transcript=[])).full_transcript == []
+
+
+def test_v5_rejects_a_single_shot_that_is_too_long():
+    raw = _good_v5_dict(shot_breakdown=[_shot(0.0, 2.5), _shot(2.5, 17.0)])  # 14.5s shot
+    with pytest.raises(ValidationError, match="shot_breakdown"):
+        ExternalVideoAnnotationV5(**raw)
+
+
+def test_v5_shot_ceiling_is_inclusive():
+    assert MAX_SHOT_SECONDS == 10.0
+    ExternalVideoAnnotationV5(**_good_v5_dict(shot_breakdown=[_shot(0.0, 10.0), _shot(10.0, 17.0)]))
+
+
+def test_v5_extends_v4_without_changing_it():
+    """v4 must still validate the already-stored real v4 row's shape —
+    v5's stricter rules live only on the new class."""
+    assert issubclass(ExternalVideoAnnotationV5, ExternalVideoAnnotationV4)
+    ExternalVideoAnnotationV4(**_good_v4_dict())
+    with pytest.raises(ValidationError):
+        ExternalVideoAnnotationV5(**_good_v4_dict())  # 11.5s shot
+
+
+def test_prompt_demands_fine_segmentation():
+    for phrase in ["sentence", "camera cut", "do not merge", "8 seconds", "10 seconds"]:
+        assert phrase in ANNOTATION_PROMPT.lower(), f"ANNOTATION_PROMPT never mentions {phrase!r}"
+
+
+# --- coverage check ------------------------------------------------------------
+
+
+def test_coverage_ok_for_a_fully_covered_video():
+    assert _check_coverage(ExternalVideoAnnotationV5(**_good_v5_dict()), V5_VIDEO_DURATION) == []
+
+
+def test_coverage_flags_shots_that_stop_early():
+    """Shots covering only 0-10s of a 32s video validate fine (each shot is
+    short) but are clearly incomplete."""
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(
+        script_structure_timeline=[{"beat": "hook", "start_sec": 0.0, "end_sec": 10.0}],
+        shot_breakdown=[_shot(0.0, 5.0), _shot(5.0, 10.0)],
+        full_transcript=[{"start_sec": 0.0, "text": "a"}, {"start_sec": 4.0, "text": "b"}],
+    ))
+    warnings = _check_coverage(ann, 32)
+    assert any("shot_breakdown" in w and "10.0" in w and "32" in w for w in warnings), warnings
+
+
+def test_coverage_flags_a_large_gap_between_shots():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(
+        shot_breakdown=[_shot(0.0, 5.0), _shot(5.0 + MAX_COVERAGE_GAP_SECONDS + 1, 17.0)]))
+    warnings = _check_coverage(ann, V5_VIDEO_DURATION)
+    assert any("gap" in w for w in warnings), warnings
+
+
+def test_coverage_tolerates_small_gaps():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(
+        shot_breakdown=[_shot(0.5, 8.0), _shot(9.0, 16.0)]))
+    assert _check_coverage(ann, V5_VIDEO_DURATION) == []
+
+
+def test_coverage_flags_empty_shot_breakdown():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(shot_breakdown=[]))
+    assert any("shot_breakdown" in w for w in _check_coverage(ann, V5_VIDEO_DURATION))
+
+
+def test_coverage_flags_shots_running_past_the_real_video_end():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict())
+    assert any("past" in w for w in _check_coverage(ann, 10))
+
+
+def test_coverage_flags_transcript_ending_far_before_the_video_does():
+    """The contract can only measure the last segment against the
+    annotation's OWN end (here 12s, so 4.0 -> 12.0 passes at exactly 8s);
+    only the real duration (13s) reveals the 9s of unaccounted tail."""
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(
+        script_structure_timeline=[{"beat": "hook", "start_sec": 0.0, "end_sec": 12.0}],
+        shot_breakdown=[_shot(0.0, 8.0), _shot(8.0, 12.0)],
+        full_transcript=[{"start_sec": 0.0, "text": "a"}, {"start_sec": 4.0, "text": "b"}],
+    ))
+    warnings = _check_coverage(ann, 13)
+    assert len(warnings) == 1 and "full_transcript" in warnings[0], warnings
+
+
+def test_coverage_does_not_flag_an_empty_transcript():
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict(full_transcript=[]))
+    assert _check_coverage(ann, V5_VIDEO_DURATION) == []
+
+
+def test_coverage_flags_unknown_duration_instead_of_silently_passing():
+    warnings = _check_coverage(ExternalVideoAnnotationV5(**_good_v5_dict()), None)
+    assert len(warnings) == 1 and "duration" in warnings[0]
+
+
 # --- derive_hook_fields --------------------------------------------------------
 
 
@@ -509,15 +686,15 @@ def test_annotate_video_raises_clear_error_when_api_key_missing(monkeypatch, fak
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with patch("qualume.annotate.gemini_watcher.genai.Client") as client_cls:
         with pytest.raises(RuntimeError, match=r"GEMINI_API_KEY.*\.env"):
-            annotate_video(fake_video)
+            annotate_video(fake_video, V5_VIDEO_DURATION)
     client_cls.assert_not_called()
 
 
 def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_key, fake_video):
-    client = _mock_client(json.dumps(_good_v4_dict()))
+    client = _mock_client(json.dumps(_good_v5_dict()))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client) as client_cls, \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
-        result = annotate_video(fake_video)
+        result = annotate_video(fake_video, V5_VIDEO_DURATION)
 
     client_cls.assert_called_once_with(api_key="test-key-not-real")
     client.files.upload.assert_called_once_with(file=fake_video)
@@ -530,22 +707,56 @@ def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_ke
     assert isinstance(contents[1], str) and contents[1].strip()
     config = call.kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema is ExternalVideoAnnotationV4
+    assert config.response_schema is ExternalVideoAnnotationV5
+    assert config.temperature == GEMINI_TEMPERATURE == None  # noqa: E711 — real sentinel, not falsy 0
 
-    assert isinstance(result.annotation, ExternalVideoAnnotationV4)
-    assert result.annotation == ExternalVideoAnnotationV4(**_good_v4_dict())
-    assert result.raw_response == _good_v4_dict()
+    assert isinstance(result.annotation, ExternalVideoAnnotationV5)
+    assert result.annotation == ExternalVideoAnnotationV5(**_good_v5_dict())
+    assert result.raw_response == _good_v5_dict()
+    assert result.coverage_warning is None
     client.files.delete.assert_called_once_with(name="files/abc123")
+
+
+def test_annotate_video_reports_incomplete_coverage_without_failing(gemini_key, fake_video):
+    """Shots that stop at 10s of a 32s video: schema-valid, so annotation is
+    kept, but the coverage gap is surfaced rather than silently accepted."""
+    raw = _good_v5_dict(
+        script_structure_timeline=[{"beat": "hook", "start_sec": 0.0, "end_sec": 10.0}],
+        shot_breakdown=[_shot(0.0, 5.0), _shot(5.0, 10.0)],
+        full_transcript=[{"start_sec": 0.0, "text": "a"}, {"start_sec": 4.0, "text": "b"}],
+    )
+    client = _mock_client(json.dumps(raw))
+    with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
+         patch("qualume.annotate.gemini_watcher.time.sleep"):
+        result = annotate_video(fake_video, 32)
+    assert isinstance(result.annotation, ExternalVideoAnnotationV5)
+    assert result.validation_error is None
+    assert "shot_breakdown" in result.coverage_warning
+
+
+def test_annotate_video_routes_the_real_collapsed_transcript_bug_to_the_degraded_path(
+        gemini_key, fake_video):
+    """The granularity check is a real ValidationError, so it goes through
+    the existing graceful path: annotation None, raw response kept."""
+    raw = _real_bug_32s_dict()
+    client = _mock_client(json.dumps(raw))
+    with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
+         patch("qualume.annotate.gemini_watcher.time.sleep"):
+        result = annotate_video(fake_video, 32)
+    assert result.annotation is None
+    assert "full_transcript" in result.validation_error
+    assert result.raw_response == raw
+    assert result.coverage_warning is None  # nothing validated to check coverage of
 
 
 def test_annotate_video_keeps_full_raw_response_including_unmapped_keys(gemini_key, fake_video):
     """Nothing Gemini returns is discarded: keys with no typed field still
     land in raw_response."""
-    raw = _good_v4_dict(unmapped_extra={"anything": [1, 2, 3]})
+    raw = _good_v5_dict(unmapped_extra={"anything": [1, 2, 3]})
     client = _mock_client(json.dumps(raw))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
-        result = annotate_video(fake_video)
+        result = annotate_video(fake_video, V5_VIDEO_DURATION)
     assert result.raw_response == raw
     assert result.raw_response["unmapped_extra"] == {"anything": [1, 2, 3]}
     assert "unmapped_extra" not in result.annotation.model_dump()
@@ -556,7 +767,7 @@ def test_annotate_video_raises_when_raw_response_is_not_a_json_object(gemini_key
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         with pytest.raises(RuntimeError, match="JSON object"):
-            annotate_video(fake_video)
+            annotate_video(fake_video, V5_VIDEO_DURATION)
     client.files.delete.assert_called_once_with(name="files/abc123")
 
 
@@ -569,7 +780,7 @@ def test_annotate_video_returns_raw_response_when_validation_fails(gemini_key, f
     client = _mock_client(json.dumps(bad_dict))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
-        result = annotate_video(fake_video)
+        result = annotate_video(fake_video, V5_VIDEO_DURATION)
     assert result.annotation is None
     assert result.validation_error is not None
     assert result.raw_response == bad_dict  # nothing lost, even though validation failed
@@ -581,14 +792,14 @@ def test_annotate_video_raises_when_file_processing_fails(gemini_key, fake_video
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         with pytest.raises(RuntimeError, match="FAILED"):
-            annotate_video(fake_video)
+            annotate_video(fake_video, V5_VIDEO_DURATION)
     client.models.generate_content.assert_not_called()
 
 
 def test_annotate_video_raises_when_local_file_missing(gemini_key, tmp_path):
     with patch("qualume.annotate.gemini_watcher.genai.Client") as client_cls:
         with pytest.raises(FileNotFoundError):
-            annotate_video(str(tmp_path / "does_not_exist.mp4"))
+            annotate_video(str(tmp_path / "does_not_exist.mp4"), V5_VIDEO_DURATION)
     client_cls.return_value.files.upload.assert_not_called()
 
 
@@ -619,16 +830,18 @@ def _cleanup_account(handle: str):
         conn.close()
 
 
-def _insert_item(account_id: str, local_video_path):
+def _insert_item(account_id: str, local_video_path, duration_seconds=None):
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             vid = uuid.uuid4().hex[:12]
             cur.execute(
                 """INSERT INTO external_content_items
-                       (watched_account_id, platform, platform_video_id, url, local_video_path)
-                   VALUES (%s, 'tiktok', %s, %s, %s) RETURNING id""",
-                (account_id, f"test_{vid}", f"https://www.tiktok.com/@test/video/{vid}", local_video_path),
+                       (watched_account_id, platform, platform_video_id, url, local_video_path,
+                        duration_seconds)
+                   VALUES (%s, 'tiktok', %s, %s, %s, %s) RETURNING id""",
+                (account_id, f"test_{vid}", f"https://www.tiktok.com/@test/video/{vid}",
+                 local_video_path, duration_seconds),
             )
             item_id = str(cur.fetchone()[0])
         conn.commit()
@@ -663,18 +876,20 @@ def test_annotate_and_store_inserts_row_with_provenance():
     _cleanup_account(handle)
     try:
         account_id = add_watched_account("tiktok", handle)
-        item_id = _insert_item(account_id, "/fake/path/7123.mp4")
+        item_id = _insert_item(account_id, "/fake/path/7123.mp4", duration_seconds=17)
         # Gemini's own hook answers deliberately disagree with its transcript/
         # shots — the stored values must be the derived ones, not these.
-        raw = _good_v4_dict(social_proof_used=True, unmapped_extra="kept",
+        raw = _good_v5_dict(social_proof_used=True, unmapped_extra="kept",
                             hook_text="Gemini's independently drifted hook",
                             visual_hook_description="Gemini's independent visual read")
         result = gemini_watcher.AnnotationResult(
-            annotation=ExternalVideoAnnotationV4(**raw), raw_response=raw)
+            annotation=ExternalVideoAnnotationV5(**raw), raw_response=raw,
+            coverage_warning="shot_breakdown stops at 17.0s of a 99s video")
 
         with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result) as mock_annotate:
             dna_id = annotate_and_store(item_id)
-        mock_annotate.assert_called_once_with("/fake/path/7123.mp4")
+        # the real duration from external_content_items is threaded through
+        mock_annotate.assert_called_once_with("/fake/path/7123.mp4", 17)
 
         conn = get_connection()
         try:
@@ -687,7 +902,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
                               analysis_model, analysis_prompt_version, analyzed_at,
                               script_structure_timeline, on_screen_text, emotion_timeline,
                               pacing_qualitative, music_mood_v2, shot_breakdown, full_transcript,
-                              raw_gemini_response
+                              raw_gemini_response, coverage_warning
                        FROM external_creative_dna WHERE id = %s""",
                     (dna_id,),
                 )
@@ -698,7 +913,8 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert row is not None
         (eci_id, hook_type, hook_text, visual, fmt, tags, cta, caption, proof, energy, tone,
          voice, pacing, music, extended, model, prompt_version, analyzed_at,
-         timeline, on_screen, emotions, pacing_q, music_v2, shots, transcript, raw_response) = row
+         timeline, on_screen, emotions, pacing_q, music_v2, shots, transcript, raw_response,
+         coverage_warning) = row
         assert str(eci_id) == item_id
         assert hook_type == "question"
         # Derived from full_transcript / shot_breakdown inside the 'hook' beat (0-2.5s)
@@ -716,7 +932,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert music is None   # legacy column stays NULL; real data is music_mood_v2
         assert extended == {}
         assert model == GEMINI_MODEL
-        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v4"
+        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v5"
         assert analyzed_at is not None
         assert timeline == raw["script_structure_timeline"]
         assert on_screen == raw["on_screen_text"]
@@ -726,6 +942,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert shots == raw["shot_breakdown"]
         assert transcript == raw["full_transcript"]
         assert raw_response == raw  # complete, including unmapped_extra and Gemini's own hook answers
+        assert coverage_warning == "shot_breakdown stops at 17.0s of a 99s video"  # queryable, not just logged
     finally:
         _cleanup_account(handle)
 
@@ -741,7 +958,7 @@ def test_annotate_and_store_keeps_raw_response_when_validation_fails():
     try:
         account_id = add_watched_account("tiktok", handle)
         item_id = _insert_item(account_id, "/fake/path/9999.mp4")
-        bad_raw = _good_v4_dict(energy_level=9,  # out of 1-5, fails strict validation
+        bad_raw = _good_v5_dict(energy_level=9,  # out of 1-5, fails strict validation
                                 hook_text="Gemini's independently drifted hook")
         result = gemini_watcher.AnnotationResult(
             annotation=None, raw_response=bad_raw, validation_error="energy_level out of range"
@@ -755,11 +972,13 @@ def test_annotate_and_store_keeps_raw_response_when_validation_fails():
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT hook_type, hook_text, visual_hook_description,
-                              script_structure_timeline, raw_gemini_response, validation_error
+                              script_structure_timeline, raw_gemini_response, validation_error,
+                              coverage_warning
                        FROM external_creative_dna WHERE id = %s""",
                     (dna_id,),
                 )
-                hook_type, hook_text, visual, timeline, raw_response, val_error = cur.fetchone()
+                (hook_type, hook_text, visual, timeline, raw_response, val_error,
+                 coverage_warning) = cur.fetchone()
         finally:
             conn.close()
 
@@ -771,6 +990,7 @@ def test_annotate_and_store_keeps_raw_response_when_validation_fails():
         assert timeline is None  # nested/typed field NOT guessed when validation failed
         assert raw_response == bad_raw  # nothing lost
         assert val_error == "energy_level out of range"
+        assert coverage_warning is None  # nothing validated to check; validation_error says why
     finally:
         _cleanup_account(handle)
 
@@ -785,7 +1005,7 @@ def test_annotate_and_store_degraded_path_leaves_hook_fields_null_when_sources_u
     try:
         account_id = add_watched_account("tiktok", handle)
         item_id = _insert_item(account_id, "/fake/path/8888.mp4")
-        bad_raw = _good_v4_dict(shot_breakdown=[{"start_sec": 0.0, "color_palette": "warm"}])
+        bad_raw = _good_v5_dict(shot_breakdown=[{"start_sec": 0.0, "color_palette": "warm"}])
         del bad_raw["full_transcript"]
         result = gemini_watcher.AnnotationResult(
             annotation=None, raw_response=bad_raw, validation_error="bad shots")
@@ -809,5 +1029,62 @@ def test_annotate_and_store_degraded_path_leaves_hook_fields_null_when_sources_u
         assert hook_text is None
         assert visual is None
         assert raw_response == bad_raw
+    finally:
+        _cleanup_account(handle)
+
+
+def test_annotate_and_store_degraded_path_rejects_the_real_bug_transcript():
+    """Regression test for the actual bug found running v4 live twice on the
+    same video: Gemini collapsed the whole video's speech into ONE
+    TranscriptSegment (individually valid — nothing wrong with a single
+    segment on its own) instead of 8 properly-segmented ones. Each item
+    parses fine, so the raw list passes _parse_raw_list, but it violates the
+    SAME granularity ceiling ExternalVideoAnnotationV5 enforces at the
+    list level. Before the fix, the degraded path still derived hook_text
+    from this oversized segment, since it only checked 'did it parse',
+    not 'is it granular enough' — silently reintroducing the exact bug
+    v5's validator exists to catch, just via the degraded path instead of
+    the happy path."""
+    handle = f"test_annot_degraded_bug_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(handle)
+    try:
+        account_id = add_watched_account("tiktok", handle)
+        item_id = _insert_item(account_id, "/fake/path/7670137194773826847.mp4")
+        bad_raw = _good_v5_dict(
+            full_transcript=[
+                # One segment covering the ENTIRE video — this is exactly
+                # what Gemini actually returned on the real re-run.
+                {"start_sec": 0.0, "text": (
+                    "Okay, if y'all have been looking for a daily immune "
+                    "support for your children, I found the perfect one. "
+                    "This is from Wish Gardens."
+                )},
+            ],
+            energy_level=9,  # also fails validation, for an unrelated reason —
+                              # the point is the transcript check specifically
+        )
+        result = gemini_watcher.AnnotationResult(
+            annotation=None, raw_response=bad_raw, validation_error="too many problems"
+        )
+
+        with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result):
+            dna_id = annotate_and_store(item_id)
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT hook_text, raw_gemini_response FROM external_creative_dna WHERE id = %s",
+                    (dna_id,),
+                )
+                hook_text, raw_response = cur.fetchone()
+        finally:
+            conn.close()
+
+        # The real bug: this used to be the ENTIRE 3-sentence transcript,
+        # attributed to the hook. Now it must be NULL — not derived from an
+        # under-segmented source, even though every individual item parsed.
+        assert hook_text is None
+        assert raw_response == bad_raw  # still nothing lost
     finally:
         _cleanup_account(handle)
