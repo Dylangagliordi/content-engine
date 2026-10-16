@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from qualume.models.contracts import ExternalVideoAnnotation, ExternalVideoAnnotationV2
+from qualume.models.contracts import ExternalVideoAnnotation, ExternalVideoAnnotationV2, ExternalVideoAnnotationV3
 from qualume.annotate import gemini_watcher
 from qualume.annotate.gemini_watcher import (
     ANALYSIS_PROMPT_VERSION,
@@ -59,6 +59,31 @@ def _good_v2_dict(**overrides):
         pacing_qualitative="medium",
         pacing_rationale="Steady shots of a few seconds each, no rapid montage",
         music_mood=["upbeat", "lofi"],
+    )
+    data.update(overrides)
+    return data
+
+
+def _good_v3_dict(**overrides):
+    data = _good_v2_dict(
+        shot_breakdown=[
+            {
+                "start_sec": 0.0, "end_sec": 2.5, "shot_type": "close_up",
+                "camera_movement": "static", "setting": "kitchen",
+                "color_palette": "warm pinks and whites", "lighting": "bright_natural",
+                "subject_action": "opening a jar",
+            },
+            {
+                "start_sec": 2.5, "end_sec": 14.0, "shot_type": "medium_shot",
+                "camera_movement": "handheld", "setting": "kitchen",
+                "color_palette": "warm pinks and whites", "lighting": "bright_natural",
+                "subject_action": "demonstrating the product",
+            },
+        ],
+        full_transcript=[
+            {"start_sec": 0.0, "text": "Why does nobody talk about this?"},
+            {"start_sec": 3.0, "text": "Let me show you exactly how it works."},
+        ],
     )
     data.update(overrides)
     return data
@@ -165,6 +190,51 @@ def test_prompt_asks_for_every_v2_field():
         assert field in ANNOTATION_PROMPT, f"ANNOTATION_PROMPT never mentions {field}"
 
 
+def test_v3_contract_extends_v2_and_accepts_good_input():
+    assert issubclass(ExternalVideoAnnotationV3, ExternalVideoAnnotationV2)
+    ann = ExternalVideoAnnotationV3(**_good_v3_dict())
+    assert ann.hook_type == "question"  # v1/v2 fields still present
+    assert len(ann.shot_breakdown) == 2
+    assert ann.shot_breakdown[0].shot_type == "close_up"
+    assert ann.shot_breakdown[1].setting == "kitchen"
+    assert len(ann.full_transcript) == 2
+    assert ann.full_transcript[0].text == "Why does nobody talk about this?"
+
+
+def test_v3_contract_rejects_shot_ending_before_it_starts():
+    with pytest.raises(ValidationError):
+        ExternalVideoAnnotationV3(**_good_v3_dict(
+            shot_breakdown=[{
+                "start_sec": 5.0, "end_sec": 1.0, "shot_type": "close_up",
+                "camera_movement": "static", "setting": "kitchen",
+                "color_palette": "warm", "lighting": "bright_natural",
+                "subject_action": "talking",
+            }]))
+
+
+def test_v3_contract_rejects_out_of_order_shots_or_transcript():
+    with pytest.raises(ValidationError):
+        ExternalVideoAnnotationV3(**_good_v3_dict(
+            full_transcript=[
+                {"start_sec": 5.0, "text": "second"},
+                {"start_sec": 1.0, "text": "first, but out of order"},
+            ]))
+
+
+def test_v3_contract_allows_empty_shot_and_transcript_lists():
+    """A silent video with one static shot still has valid (not empty) data
+    in practice, but the schema shouldn't force a lie if either is genuinely
+    absent."""
+    ann = ExternalVideoAnnotationV3(**_good_v3_dict(full_transcript=[]))
+    assert ann.full_transcript == []
+
+
+def test_prompt_mentions_shot_breakdown_and_full_transcript():
+    assert "shot_breakdown" in ANNOTATION_PROMPT
+    assert "full_transcript" in ANNOTATION_PROMPT
+    assert "COMPLETE transcript" in ANNOTATION_PROMPT  # not just the hook
+
+
 # --- annotate_video ----------------------------------------------------------
 
 
@@ -200,7 +270,7 @@ def test_annotate_video_raises_clear_error_when_api_key_missing(monkeypatch, fak
 
 
 def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_key, fake_video):
-    client = _mock_client(json.dumps(_good_v2_dict()))
+    client = _mock_client(json.dumps(_good_v3_dict()))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client) as client_cls, \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         result = annotate_video(fake_video)
@@ -216,18 +286,18 @@ def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_ke
     assert isinstance(contents[1], str) and contents[1].strip()
     config = call.kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema is ExternalVideoAnnotationV2
+    assert config.response_schema is ExternalVideoAnnotationV3
 
-    assert isinstance(result.annotation, ExternalVideoAnnotationV2)
-    assert result.annotation == ExternalVideoAnnotationV2(**_good_v2_dict())
-    assert result.raw_response == _good_v2_dict()
+    assert isinstance(result.annotation, ExternalVideoAnnotationV3)
+    assert result.annotation == ExternalVideoAnnotationV3(**_good_v3_dict())
+    assert result.raw_response == _good_v3_dict()
     client.files.delete.assert_called_once_with(name="files/abc123")
 
 
 def test_annotate_video_keeps_full_raw_response_including_unmapped_keys(gemini_key, fake_video):
     """Nothing Gemini returns is discarded: keys with no typed field still
     land in raw_response."""
-    raw = _good_v2_dict(unmapped_extra={"anything": [1, 2, 3]})
+    raw = _good_v3_dict(unmapped_extra={"anything": [1, 2, 3]})
     client = _mock_client(json.dumps(raw))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
@@ -350,9 +420,9 @@ def test_annotate_and_store_inserts_row_with_provenance():
     try:
         account_id = add_watched_account("tiktok", handle)
         item_id = _insert_item(account_id, "/fake/path/7123.mp4")
-        raw = _good_v2_dict(social_proof_used=True, unmapped_extra="kept")
+        raw = _good_v3_dict(social_proof_used=True, unmapped_extra="kept")
         result = gemini_watcher.AnnotationResult(
-            annotation=ExternalVideoAnnotationV2(**raw), raw_response=raw)
+            annotation=ExternalVideoAnnotationV3(**raw), raw_response=raw)
 
         with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result) as mock_annotate:
             dna_id = annotate_and_store(item_id)
@@ -368,7 +438,8 @@ def test_annotate_and_store_inserts_row_with_provenance():
                               pacing_cuts_per_min, music_mood, extended_features,
                               analysis_model, analysis_prompt_version, analyzed_at,
                               script_structure_timeline, on_screen_text, emotion_timeline,
-                              pacing_qualitative, music_mood_v2, raw_gemini_response
+                              pacing_qualitative, music_mood_v2, shot_breakdown, full_transcript,
+                              raw_gemini_response
                        FROM external_creative_dna WHERE id = %s""",
                     (dna_id,),
                 )
@@ -379,7 +450,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert row is not None
         (eci_id, hook_type, hook_text, visual, fmt, tags, cta, caption, proof, energy, tone,
          voice, pacing, music, extended, model, prompt_version, analyzed_at,
-         timeline, on_screen, emotions, pacing_q, music_v2, raw_response) = row
+         timeline, on_screen, emotions, pacing_q, music_v2, shots, transcript, raw_response) = row
         assert str(eci_id) == item_id
         assert hook_type == "question"
         assert hook_text == "Why does nobody talk about this?"
@@ -396,13 +467,15 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert music is None   # legacy column stays NULL; real data is music_mood_v2
         assert extended == {}
         assert model == GEMINI_MODEL
-        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v2"
+        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v3"
         assert analyzed_at is not None
         assert timeline == raw["script_structure_timeline"]
         assert on_screen == raw["on_screen_text"]
         assert emotions == raw["emotion_timeline"]
         assert pacing_q == "medium"
         assert music_v2 == ["upbeat", "lofi"]
+        assert shots == raw["shot_breakdown"]
+        assert transcript == raw["full_transcript"]
         assert raw_response == raw  # complete, including unmapped_extra
     finally:
         _cleanup_account(handle)

@@ -102,6 +102,52 @@ class ExternalVideoAnnotationV2(ExternalVideoAnnotation):
         return self
 
 
+class ShotBreakdown(BaseModel):
+    """One camera shot/setup — the actual reproducible unit for visual
+    recreation (finer-grained than script_structure_timeline's story beats:
+    one beat like 'demo' can span several shots)."""
+    start_sec: float = Field(ge=0, description="Shot start, seconds from video start")
+    end_sec: float = Field(ge=0, description="Shot end, seconds from video start")
+    shot_type: str = Field(description="e.g. close_up, medium_shot, wide_shot, extreme_close_up, pov")
+    camera_movement: str = Field(description="e.g. static, handheld, pan, zoom_in, zoom_out, tracking")
+    setting: str = Field(description="Where this shot takes place, e.g. kitchen, bedroom, outdoor park")
+    color_palette: str = Field(description="Dominant colors observed, named not hex, e.g. 'warm pinks and whites', 'muted earth tones'")
+    lighting: str = Field(description="e.g. bright_natural, dim, backlit, studio, golden_hour")
+    subject_action: str = Field(description="What the person/subject is doing in this shot, one short phrase")
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self):
+        if self.end_sec < self.start_sec:
+            raise ValueError(f"shot ends ({self.end_sec}) before it starts ({self.start_sec})")
+        return self
+
+
+class TranscriptSegment(BaseModel):
+    """One spoken utterance — the FULL transcript, not just the hook.
+    hook_text (v1) only ever captured the opening few seconds; this covers
+    the entire video."""
+    start_sec: float = Field(ge=0, description="Segment start, seconds from video start")
+    text: str = Field(description="Exact words spoken, verbatim")
+
+
+class ExternalVideoAnnotationV3(ExternalVideoAnnotationV2):
+    """v3 adds per-shot visual composition (color, lighting, camera, setting)
+    and the complete spoken transcript — the goal being enough structured
+    detail to brief a stylistically/structurally equivalent new video, not
+    just a similar-shaped script. The exact source file (audio_track/
+    audio_artist already captured losslessly via external_content_items from
+    yt-dlp metadata) + raw_gemini_response cover anything this typed schema
+    doesn't anticipate."""
+    shot_breakdown: list[ShotBreakdown] = Field(description="Every distinct camera shot, in order, covering the whole video")
+    full_transcript: list[TranscriptSegment] = Field(description="Every spoken utterance in the video, in order, verbatim; empty if no speech")
+
+    @model_validator(mode="after")
+    def _v3_timelines_in_order(self):
+        _require_non_decreasing([s.start_sec for s in self.shot_breakdown], "shot_breakdown")
+        _require_non_decreasing([t.start_sec for t in self.full_transcript], "full_transcript")
+        return self
+
+
 class CampaignBrief(BaseModel):
     """Input contract to the WRITE engine."""
     product_or_topic: str

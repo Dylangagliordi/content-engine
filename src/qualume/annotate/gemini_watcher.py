@@ -6,7 +6,9 @@ plans/learn-engine-idea-sourcing-architecture.md, "How AI actually watches a
 video"). Since v2, every signal — including music mood and pacing — comes
 from this one call; there is no separate signal-processing job. Pacing is
 qualitative only (Gemini samples video at 1 FPS, so exact cut counts are
-unreliable).
+unreliable). v3 adds per-shot visual composition and the full spoken
+transcript, aiming for enough structured detail that a new video could be
+briefed as stylistically/structurally equivalent — not just a similar hook.
 """
 import json
 import os
@@ -21,9 +23,9 @@ from qualume import config  # noqa: F401 — loads .env into os.environ
 from qualume.db.connection import get_connection
 from psycopg2.extras import Json
 
-from qualume.models.contracts import ExternalVideoAnnotationV2
+from qualume.models.contracts import ExternalVideoAnnotationV3
 
-ANALYSIS_PROMPT_VERSION = "v2"
+ANALYSIS_PROMPT_VERSION = "v3"
 
 # gemini-3.8-flash is the newest/most capable and real on this key, but is
 # returning persistent 503 ServerError specifically on video input as of
@@ -93,11 +95,30 @@ pacing read (e.g. shot length, camera movement, speech speed).
 - music_mood: mood tags for the music, from listening to the audio, lowercase \
 (e.g. upbeat, melancholic, suspenseful, dreamy, aggressive, lofi). Empty list \
 if there is no music.
+
+Shot-level and transcript fields. These are the most granular fields — the \
+goal is enough detail that someone could brief a NEW video with the same \
+visual style and structure without rewatching this one.
+- shot_breakdown: every distinct camera shot/setup, in chronological order, \
+covering the whole video start to end (no gaps). For each shot give: \
+start_sec, end_sec, shot_type (e.g. close_up, medium_shot, wide_shot, \
+extreme_close_up, pov), camera_movement (e.g. static, handheld, pan, \
+zoom_in, zoom_out, tracking), setting (where it takes place, e.g. kitchen, \
+bedroom, outdoor park), color_palette (dominant colors observed, named not \
+hex, e.g. "warm pinks and whites", "muted earth tones"), lighting (e.g. \
+bright_natural, dim, backlit, studio, golden_hour), and subject_action (what \
+the person/subject is doing, one short phrase). A beat from \
+script_structure_timeline can span multiple shots if the camera setup \
+changes within it.
+- full_transcript: every spoken utterance in the video, in chronological \
+order, transcribed verbatim, each with the start_sec it begins. This is the \
+COMPLETE transcript, not just the hook — include everything said, not only \
+the opening few seconds. Empty list if there is no speech.
 """
 
 
 class AnnotationResult(NamedTuple):
-    annotation: ExternalVideoAnnotationV2 | None  # None if schema validation failed
+    annotation: ExternalVideoAnnotationV3 | None  # None if schema validation failed
     raw_response: dict  # complete parsed Gemini response, including unmapped keys —
                          # ALWAYS populated when Gemini returned anything parseable,
                          # even if `annotation` is None. Nothing gets silently dropped.
@@ -146,7 +167,7 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
             contents=[video, ANNOTATION_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotationV2,
+                response_schema=ExternalVideoAnnotationV3,
             ),
         )
         # Validate the raw text ourselves: the SDK's response.parsed silently
@@ -159,7 +180,7 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
                 f"Gemini response for {local_video_path} is not a JSON object: {response.text[:200]}"
             )
         try:
-            annotation = ExternalVideoAnnotationV2.model_validate(raw_response)
+            annotation = ExternalVideoAnnotationV3.model_validate(raw_response)
             return AnnotationResult(annotation=annotation, raw_response=raw_response)
         except ValidationError as e:
             # Don't lose the raw response just because our strict schema (e.g.
@@ -219,6 +240,8 @@ def annotate_and_store(external_content_item_id: str) -> str:
                 on_screen_text=Json([t.model_dump() for t in ann.on_screen_text]),
                 emotion_timeline=Json([e.model_dump() for e in ann.emotion_timeline]),
                 pacing_qualitative=ann.pacing_qualitative, music_mood_v2=ann.music_mood,
+                shot_breakdown=Json([s.model_dump() for s in ann.shot_breakdown]),
+                full_transcript=Json([t.model_dump() for t in ann.full_transcript]),
             )
         else:
             # Validation failed — pull what we safely can straight from the raw
@@ -238,6 +261,7 @@ def annotate_and_store(external_content_item_id: str) -> str:
                 voice_delivery_style=_raw("voice_delivery_style"),
                 script_structure_timeline=None, on_screen_text=None, emotion_timeline=None,
                 pacing_qualitative=_raw("pacing_qualitative"), music_mood_v2=_raw("music_mood"),
+                shot_breakdown=None, full_transcript=None,
             )
 
         with conn.cursor() as cur:
@@ -247,10 +271,11 @@ def annotate_and_store(external_content_item_id: str) -> str:
                         format_tag, script_structure_tags, cta_type, caption_style,
                         social_proof_used, energy_level, tone_category, voice_delivery_style,
                         script_structure_timeline, on_screen_text, emotion_timeline,
-                        pacing_qualitative, music_mood_v2, raw_gemini_response, validation_error,
+                        pacing_qualitative, music_mood_v2, shot_breakdown, full_transcript,
+                        raw_gemini_response, validation_error,
                         analysis_model, analysis_prompt_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (
                     external_content_item_id, values["hook_type"], values["hook_text"],
@@ -260,6 +285,7 @@ def annotate_and_store(external_content_item_id: str) -> str:
                     values["voice_delivery_style"], values["script_structure_timeline"],
                     values["on_screen_text"], values["emotion_timeline"],
                     values["pacing_qualitative"], values["music_mood_v2"],
+                    values["shot_breakdown"], values["full_transcript"],
                     Json(raw_response), validation_error,
                     GEMINI_MODEL, ANALYSIS_PROMPT_VERSION,
                 ),
