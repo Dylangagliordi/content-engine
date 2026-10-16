@@ -105,13 +105,58 @@ class ExternalVideoAnnotationV2(ExternalVideoAnnotation):
 class ShotBreakdown(BaseModel):
     """One camera shot/setup — the actual reproducible unit for visual
     recreation (finer-grained than script_structure_timeline's story beats:
-    one beat like 'demo' can span several shots)."""
+    one beat like 'demo' can span several shots). v3's shape — kept
+    unchanged so the real stored v3 row still validates against this exact
+    class (versioning principle: every row traceable to exactly what
+    produced it). v4 uses ShotBreakdownV4 below instead of mutating this."""
     start_sec: float = Field(ge=0, description="Shot start, seconds from video start")
     end_sec: float = Field(ge=0, description="Shot end, seconds from video start")
     shot_type: str = Field(description="e.g. close_up, medium_shot, wide_shot, extreme_close_up, pov")
     camera_movement: str = Field(description="e.g. static, handheld, pan, zoom_in, zoom_out, tracking")
     setting: str = Field(description="Where this shot takes place, e.g. kitchen, bedroom, outdoor park")
     color_palette: str = Field(description="Dominant colors observed, named not hex, e.g. 'warm pinks and whites', 'muted earth tones'")
+    lighting: str = Field(description="e.g. bright_natural, dim, backlit, studio, golden_hour")
+    subject_action: str = Field(description="What the person/subject is doing in this shot, one short phrase")
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self):
+        if self.end_sec < self.start_sec:
+            raise ValueError(f"shot ends ({self.end_sec}) before it starts ({self.start_sec})")
+        return self
+
+
+ColorTemperature = Literal["warm", "cool", "neutral", "mixed"]
+
+# Deliberately small and fixed so shots can be GROUP BY'd / filtered in SQL
+# (v3's free-prose color_palette — 'bright warm tones', 'deep reds and bright
+# whites' — couldn't be). Unlike shot_type/lighting etc, basic color names
+# aren't a "learned feature" space, so a closed vocabulary loses nothing.
+BasicColor = Literal[
+    "red", "orange", "yellow", "green", "blue", "purple",
+    "pink", "brown", "black", "white", "gray", "beige",
+]
+
+SettingCategory = Literal[
+    "home_indoor", "home_outdoor", "studio", "public_indoor", "public_outdoor", "vehicle", "other",
+]
+
+
+class ShotBreakdownV4(BaseModel):
+    """v4's shot shape — a NEW class, not a mutation of ShotBreakdown, so v3's
+    real stored row stays validatable against the class it was actually
+    produced by. color_palette (free prose) is REMOVED, replaced by
+    color_temperature + dominant_colors (fixed vocabularies). setting_category
+    is a coarse queryable grouping added ALONGSIDE free-text setting, which
+    keeps the human-readable detail — not redundant with it, unlike
+    color_palette would have been with the new color fields."""
+    start_sec: float = Field(ge=0, description="Shot start, seconds from video start")
+    end_sec: float = Field(ge=0, description="Shot end, seconds from video start")
+    shot_type: str = Field(description="e.g. close_up, medium_shot, wide_shot, extreme_close_up, pov")
+    camera_movement: str = Field(description="e.g. static, handheld, pan, zoom_in, zoom_out, tracking")
+    setting: str = Field(description="Where this shot takes place, e.g. kitchen, bedroom, outdoor park")
+    setting_category: SettingCategory = Field(description="Coarse setting group for querying")
+    color_temperature: ColorTemperature = Field(description="Overall color temperature of the shot")
+    dominant_colors: list[BasicColor] = Field(min_length=1, description="Dominant colors in the shot, basic color names only, most dominant first")
     lighting: str = Field(description="e.g. bright_natural, dim, backlit, studio, golden_hour")
     subject_action: str = Field(description="What the person/subject is doing in this shot, one short phrase")
 
@@ -146,6 +191,30 @@ class ExternalVideoAnnotationV3(ExternalVideoAnnotationV2):
         _require_non_decreasing([s.start_sec for s in self.shot_breakdown], "shot_breakdown")
         _require_non_decreasing([t.start_sec for t in self.full_transcript], "full_transcript")
         return self
+
+
+class ExternalVideoAnnotationV4(ExternalVideoAnnotationV3):
+    """v4 fixes two problems found reviewing real v3 output:
+
+    1. Redundancy. hook_text / visual_hook_description were answered by Gemini
+       independently, in the same call as full_transcript / shot_breakdown, so
+       the two answers drifted (real video: full_transcript's first segment
+       had "I found the perfect one", hook_text omitted it). Gemini still
+       fills them here (they're inherited and still in the response schema),
+       but they are NOT stored: gemini_watcher.derive_hook_fields recomputes
+       both from script_structure_timeline + full_transcript + shot_breakdown
+       before persisting, so there's one source of truth. Gemini's own answers
+       survive only in raw_gemini_response.
+    2. Queryability. ShotBreakdown.color_palette (free prose) became
+       color_temperature + dominant_colors (fixed vocabularies), plus a coarse
+       setting_category — a NEW shot class, ShotBreakdownV4, overriding the
+       field below. v3's own ShotBreakdown class is untouched, so the real
+       stored v3 row still validates against ExternalVideoAnnotationV3. No
+       new top-level columns; the changes live inside shot_breakdown's JSONB.
+
+    Learned-label fields (hook_type, format_tag, shot_type, lighting, ...)
+    deliberately stay free strings — see creative_dna_feature_registry."""
+    shot_breakdown: list[ShotBreakdownV4] = Field(description="Every distinct camera shot, in order, covering the whole video")
 
 
 class CampaignBrief(BaseModel):

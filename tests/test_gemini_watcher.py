@@ -6,7 +6,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from qualume.models.contracts import ExternalVideoAnnotation, ExternalVideoAnnotationV2, ExternalVideoAnnotationV3
+from qualume.models.contracts import (
+    ExternalVideoAnnotation,
+    ExternalVideoAnnotationV2,
+    ExternalVideoAnnotationV3,
+    ExternalVideoAnnotationV4,
+    ScriptBeat,
+    ShotBreakdown,
+    ShotBreakdownV4,
+    TranscriptSegment,
+)
 from qualume.annotate import gemini_watcher
 from qualume.annotate.gemini_watcher import (
     ANALYSIS_PROMPT_VERSION,
@@ -14,6 +23,7 @@ from qualume.annotate.gemini_watcher import (
     GEMINI_MODEL,
     annotate_video,
     annotate_and_store,
+    derive_hook_fields,
 )
 from qualume.db.watchlist import add_watched_account
 from qualume.db.connection import get_connection
@@ -65,6 +75,9 @@ def _good_v2_dict(**overrides):
 
 
 def _good_v3_dict(**overrides):
+    # v3's REAL shape (color_palette, free prose) — must stay this way so the
+    # real stored v3 row and ExternalVideoAnnotationV3 tests reflect what was
+    # actually asked of Gemini at the time, not v4's later shot fields.
     data = _good_v2_dict(
         shot_breakdown=[
             {
@@ -85,6 +98,37 @@ def _good_v3_dict(**overrides):
             {"start_sec": 3.0, "text": "Let me show you exactly how it works."},
         ],
     )
+    data.update(overrides)
+    return data
+
+
+def _good_v4_dict(**overrides):
+    # v4's shape: same as v2's base fields, but shot_breakdown uses the NEW
+    # ShotBreakdownV4 fields (setting_category/color_temperature/
+    # dominant_colors instead of v3's free-prose color_palette).
+    data = _good_v2_dict(
+        shot_breakdown=[
+            _shot(0.0, 2.5, subject_action="opening a jar"),
+            _shot(2.5, 14.0, camera_movement="handheld",
+                  subject_action="demonstrating the product"),
+        ],
+        full_transcript=[
+            {"start_sec": 0.0, "text": "Why does nobody talk about this?"},
+            {"start_sec": 3.0, "text": "Let me show you exactly how it works."},
+        ],
+    )
+    data.update(overrides)
+    return data
+
+
+def _shot(start, end, **overrides):
+    data = {
+        "start_sec": start, "end_sec": end, "shot_type": "close_up",
+        "camera_movement": "static", "setting": "kitchen",
+        "setting_category": "home_indoor", "color_temperature": "warm",
+        "dominant_colors": ["pink", "white"], "lighting": "bright_natural",
+        "subject_action": "opening a jar",
+    }
     data.update(overrides)
     return data
 
@@ -229,6 +273,206 @@ def test_v3_contract_allows_empty_shot_and_transcript_lists():
     assert ann.full_transcript == []
 
 
+# --- Contract v4 -------------------------------------------------------------
+
+
+def test_v4_contract_extends_v3_and_accepts_good_input():
+    assert issubclass(ExternalVideoAnnotationV4, ExternalVideoAnnotationV3)
+    ann = ExternalVideoAnnotationV4(**_good_v4_dict())
+    shot = ann.shot_breakdown[0]
+    assert shot.color_temperature == "warm"
+    assert shot.dominant_colors == ["pink", "white"]
+    assert shot.setting_category == "home_indoor"
+    assert shot.setting == "kitchen"  # free-text detail kept alongside the category
+
+
+def test_color_palette_no_longer_exists_in_v4():
+    """Replaced by color_temperature + dominant_colors; keeping it alongside
+    would be the same redundancy problem in a new form. v3's own
+    ShotBreakdown is untouched (it has color_palette, correctly — that's
+    literally what was asked of Gemini for the real stored v3 row)."""
+    assert "color_palette" not in ShotBreakdownV4.model_fields
+    assert "color_palette" in ShotBreakdown.model_fields  # v3's real shape, untouched
+    schema = ExternalVideoAnnotationV4.model_json_schema()
+    for model_schema in [schema, *schema["$defs"].values()]:
+        assert "color_palette" not in model_schema.get("properties", {})
+
+
+@pytest.mark.parametrize("temp", ["warm", "cool", "neutral", "mixed"])
+def test_shot_accepts_every_color_temperature(temp):
+    assert ShotBreakdownV4(**_shot(0, 1, color_temperature=temp)).color_temperature == temp
+
+
+@pytest.mark.parametrize("category", [
+    "home_indoor", "home_outdoor", "studio", "public_indoor", "public_outdoor", "vehicle", "other",
+])
+def test_shot_accepts_every_setting_category(category):
+    assert ShotBreakdownV4(**_shot(0, 1, setting_category=category)).setting_category == category
+
+
+def test_shot_accepts_the_full_basic_color_vocabulary():
+    colors = ["red", "orange", "yellow", "green", "blue", "purple",
+              "pink", "brown", "black", "white", "gray", "beige"]
+    assert ShotBreakdownV4(**_shot(0, 1, dominant_colors=colors)).dominant_colors == colors
+
+
+@pytest.mark.parametrize("overrides", [
+    {"color_temperature": "hot"},
+    {"color_temperature": "bright warm tones"},  # the old free-prose style
+    {"dominant_colors": ["pink", "fuchsia"]},  # outside the fixed vocabulary
+    {"dominant_colors": ["deep reds and bright whites"]},
+    {"dominant_colors": ["Pink"]},  # vocabulary is exact lowercase
+    {"dominant_colors": []},  # every visible shot has at least one color
+    {"setting_category": "kitchen"},  # that's `setting`, not the coarse category
+    {"setting_category": "outdoor"},
+])
+def test_shot_rejects_values_outside_the_fixed_vocabularies(overrides):
+    with pytest.raises(ValidationError):
+        ShotBreakdownV4(**_shot(0, 1, **overrides))
+
+
+@pytest.mark.parametrize("missing", ["color_temperature", "dominant_colors", "setting_category"])
+def test_shot_requires_the_new_queryable_fields(missing):
+    data = _shot(0, 1)
+    del data[missing]
+    with pytest.raises(ValidationError):
+        ShotBreakdownV4(**data)
+
+
+def test_hook_type_and_other_learned_labels_stay_free_strings():
+    """Deliberately NOT enums: features are learned over time (see
+    creative_dna_feature_registry), so an unanticipated-but-valid label must
+    not be rejected."""
+    ann = ExternalVideoAnnotationV4(**_good_v4_dict(
+        hook_type="never_seen_before_hook", format_tag="new_format", cta_type="new_cta",
+        shot_breakdown=[_shot(0, 2.5, shot_type="dutch_angle", camera_movement="whip_pan",
+                              lighting="neon_rgb")],
+    ))
+    assert ann.hook_type == "never_seen_before_hook"
+    assert ann.shot_breakdown[0].shot_type == "dutch_angle"
+
+
+def test_prompt_describes_v4_shot_fields_and_their_vocabularies():
+    for word in ["color_temperature", "dominant_colors", "setting_category",
+                 "warm", "cool", "neutral", "mixed", "beige", "gray",
+                 "home_indoor", "public_outdoor", "vehicle"]:
+        assert word in ANNOTATION_PROMPT, f"ANNOTATION_PROMPT never mentions {word}"
+
+
+# --- derive_hook_fields --------------------------------------------------------
+
+
+def _beats(*triples):
+    return [ScriptBeat(beat=b, start_sec=s, end_sec=e) for b, s, e in triples]
+
+
+def _transcript(*pairs):
+    return [TranscriptSegment(start_sec=s, text=t) for s, t in pairs]
+
+
+def _shots(*shots):
+    return [ShotBreakdownV4(**s) for s in shots]
+
+
+def test_derive_hook_text_joins_transcript_segments_inside_the_hook_beat():
+    """The motivating real case: Gemini's own hook_text dropped 'I found the
+    perfect one' while full_transcript captured it. Deriving from the
+    transcript makes them agree by construction."""
+    hook_text, _ = derive_hook_fields(
+        _beats(("hook", 0.0, 4.0), ("demo", 4.0, 12.0)),
+        _transcript((0.0, "I found the perfect one."), (2.1, "You need this."),
+                    (4.0, "Here's how it works."), (8.0, "So easy.")),
+        _shots(_shot(0.0, 12.0)),
+    )
+    assert hook_text == "I found the perfect one. You need this."
+
+
+def test_derive_hook_window_end_is_exclusive_and_start_is_inclusive():
+    hook_text, _ = derive_hook_fields(
+        _beats(("intro", 0.0, 1.0), ("hook", 1.0, 3.0), ("cta", 3.0, 5.0)),
+        _transcript((0.5, "before"), (1.0, "at start"), (2.9, "inside"), (3.0, "at end")),
+        _shots(_shot(0.0, 5.0)),
+    )
+    assert hook_text == "at start inside"
+
+
+def test_derive_hook_uses_the_beat_named_hook_even_when_not_first():
+    hook_text, _ = derive_hook_fields(
+        _beats(("cold_open", 0.0, 2.0), ("hook", 2.0, 5.0)),
+        _transcript((0.0, "ambient"), (2.5, "the actual hook")),
+        _shots(_shot(0.0, 5.0)),
+    )
+    assert hook_text == "the actual hook"
+
+
+def test_derive_hook_falls_back_to_first_three_seconds_without_a_hook_beat():
+    hook_text, visual = derive_hook_fields(
+        _beats(("problem", 0.0, 6.0), ("cta", 6.0, 9.0)),
+        _transcript((0.0, "one"), (2.9, "two"), (3.0, "three")),
+        _shots(_shot(0.0, 3.0, shot_type="wide_shot", setting="bedroom",
+                     subject_action="unboxing a package"),
+               _shot(3.0, 9.0, shot_type="close_up")),
+    )
+    assert hook_text == "one two"
+    assert visual == "A wide shot in bedroom: unboxing a package."
+
+
+def test_derive_hook_falls_back_when_timeline_is_empty():
+    hook_text, _ = derive_hook_fields([], _transcript((1.0, "hi")), _shots(_shot(0.0, 3.0)))
+    assert hook_text == "hi"
+
+
+def test_derive_hook_text_empty_when_transcript_empty():
+    hook_text, visual = derive_hook_fields(
+        _beats(("hook", 0.0, 3.0)), [], _shots(_shot(0.0, 3.0)))
+    assert hook_text == ""
+    assert visual  # visuals still derived for a silent video
+
+
+def test_derive_hook_text_empty_when_no_segment_in_window():
+    hook_text, _ = derive_hook_fields(
+        _beats(("hook", 0.0, 2.0)), _transcript((5.0, "later")), _shots(_shot(0.0, 6.0)))
+    assert hook_text == ""
+
+
+def test_derive_visual_describes_the_single_overlapping_shot():
+    _, visual = derive_hook_fields(
+        _beats(("hook", 0.0, 2.5)), [],
+        _shots(_shot(0.0, 2.5, shot_type="extreme_close_up", setting="bathroom",
+                     subject_action="applying serum"),
+               _shot(2.5, 8.0, shot_type="wide_shot")),
+    )
+    assert visual == "An extreme close up shot in bathroom: applying serum."
+
+
+def test_derive_visual_notes_the_transition_when_multiple_shots_overlap():
+    _, visual = derive_hook_fields(
+        _beats(("hook", 1.0, 4.0)), [],
+        _shots(_shot(0.0, 2.0, shot_type="close_up", setting="kitchen",
+                     subject_action="opening a jar"),
+               _shot(2.0, 6.0, shot_type="medium_shot", setting="kitchen",
+                     subject_action="holding the jar up to camera"),
+               _shot(6.0, 9.0, shot_type="wide_shot")),
+    )
+    assert visual == ("A close up shot in kitchen: opening a jar. "
+                      "Then cuts to a medium shot: holding the jar up to camera.")
+
+
+def test_derive_visual_counts_extra_shots_when_more_than_two_overlap():
+    _, visual = derive_hook_fields(
+        _beats(("hook", 0.0, 3.0)), [],
+        _shots(_shot(0.0, 1.0, subject_action="a"), _shot(1.0, 2.0, shot_type="pov",
+                                                          subject_action="b"),
+               _shot(2.0, 3.0, subject_action="c")),
+    )
+    assert visual == "A close up shot in kitchen: a. Then cuts through 2 more shots, starting with a pov shot: b."
+
+
+def test_derive_visual_empty_when_no_shot_overlaps():
+    _, visual = derive_hook_fields(_beats(("hook", 0.0, 3.0)), [], [])
+    assert visual == ""
+
+
 def test_prompt_mentions_shot_breakdown_and_full_transcript():
     assert "shot_breakdown" in ANNOTATION_PROMPT
     assert "full_transcript" in ANNOTATION_PROMPT
@@ -270,7 +514,7 @@ def test_annotate_video_raises_clear_error_when_api_key_missing(monkeypatch, fak
 
 
 def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_key, fake_video):
-    client = _mock_client(json.dumps(_good_v3_dict()))
+    client = _mock_client(json.dumps(_good_v4_dict()))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client) as client_cls, \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         result = annotate_video(fake_video)
@@ -286,18 +530,18 @@ def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_ke
     assert isinstance(contents[1], str) and contents[1].strip()
     config = call.kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema is ExternalVideoAnnotationV3
+    assert config.response_schema is ExternalVideoAnnotationV4
 
-    assert isinstance(result.annotation, ExternalVideoAnnotationV3)
-    assert result.annotation == ExternalVideoAnnotationV3(**_good_v3_dict())
-    assert result.raw_response == _good_v3_dict()
+    assert isinstance(result.annotation, ExternalVideoAnnotationV4)
+    assert result.annotation == ExternalVideoAnnotationV4(**_good_v4_dict())
+    assert result.raw_response == _good_v4_dict()
     client.files.delete.assert_called_once_with(name="files/abc123")
 
 
 def test_annotate_video_keeps_full_raw_response_including_unmapped_keys(gemini_key, fake_video):
     """Nothing Gemini returns is discarded: keys with no typed field still
     land in raw_response."""
-    raw = _good_v3_dict(unmapped_extra={"anything": [1, 2, 3]})
+    raw = _good_v4_dict(unmapped_extra={"anything": [1, 2, 3]})
     client = _mock_client(json.dumps(raw))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
@@ -420,9 +664,13 @@ def test_annotate_and_store_inserts_row_with_provenance():
     try:
         account_id = add_watched_account("tiktok", handle)
         item_id = _insert_item(account_id, "/fake/path/7123.mp4")
-        raw = _good_v3_dict(social_proof_used=True, unmapped_extra="kept")
+        # Gemini's own hook answers deliberately disagree with its transcript/
+        # shots — the stored values must be the derived ones, not these.
+        raw = _good_v4_dict(social_proof_used=True, unmapped_extra="kept",
+                            hook_text="Gemini's independently drifted hook",
+                            visual_hook_description="Gemini's independent visual read")
         result = gemini_watcher.AnnotationResult(
-            annotation=ExternalVideoAnnotationV3(**raw), raw_response=raw)
+            annotation=ExternalVideoAnnotationV4(**raw), raw_response=raw)
 
         with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result) as mock_annotate:
             dna_id = annotate_and_store(item_id)
@@ -453,8 +701,9 @@ def test_annotate_and_store_inserts_row_with_provenance():
          timeline, on_screen, emotions, pacing_q, music_v2, shots, transcript, raw_response) = row
         assert str(eci_id) == item_id
         assert hook_type == "question"
+        # Derived from full_transcript / shot_breakdown inside the 'hook' beat (0-2.5s)
         assert hook_text == "Why does nobody talk about this?"
-        assert visual == "Close-up of hands opening a jar"
+        assert visual == "A close up shot in kitchen: opening a jar."
         assert fmt == "talking_head"
         assert tags == ["problem", "demo", "cta"]
         assert cta == "follow"
@@ -467,7 +716,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert music is None   # legacy column stays NULL; real data is music_mood_v2
         assert extended == {}
         assert model == GEMINI_MODEL
-        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v3"
+        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v4"
         assert analyzed_at is not None
         assert timeline == raw["script_structure_timeline"]
         assert on_screen == raw["on_screen_text"]
@@ -476,7 +725,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert music_v2 == ["upbeat", "lofi"]
         assert shots == raw["shot_breakdown"]
         assert transcript == raw["full_transcript"]
-        assert raw_response == raw  # complete, including unmapped_extra
+        assert raw_response == raw  # complete, including unmapped_extra and Gemini's own hook answers
     finally:
         _cleanup_account(handle)
 
@@ -492,7 +741,8 @@ def test_annotate_and_store_keeps_raw_response_when_validation_fails():
     try:
         account_id = add_watched_account("tiktok", handle)
         item_id = _insert_item(account_id, "/fake/path/9999.mp4")
-        bad_raw = _good_v2_dict(energy_level=9)  # out of 1-5, fails strict validation
+        bad_raw = _good_v4_dict(energy_level=9,  # out of 1-5, fails strict validation
+                                hook_text="Gemini's independently drifted hook")
         result = gemini_watcher.AnnotationResult(
             annotation=None, raw_response=bad_raw, validation_error="energy_level out of range"
         )
@@ -504,19 +754,60 @@ def test_annotate_and_store_keeps_raw_response_when_validation_fails():
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT hook_type, hook_text, script_structure_timeline,
-                              raw_gemini_response, validation_error
+                    """SELECT hook_type, hook_text, visual_hook_description,
+                              script_structure_timeline, raw_gemini_response, validation_error
                        FROM external_creative_dna WHERE id = %s""",
                     (dna_id,),
                 )
-                hook_type, hook_text, timeline, raw_response, val_error = cur.fetchone()
+                hook_type, hook_text, visual, timeline, raw_response, val_error = cur.fetchone()
         finally:
             conn.close()
 
         assert hook_type == "question"  # best-effort scalar still filled
+        # Still derived (best-effort) from the raw transcript/shots, never
+        # Gemini's independent hook_text answer.
         assert hook_text == "Why does nobody talk about this?"
+        assert visual == "A close up shot in kitchen: opening a jar."
         assert timeline is None  # nested/typed field NOT guessed when validation failed
         assert raw_response == bad_raw  # nothing lost
         assert val_error == "energy_level out of range"
+    finally:
+        _cleanup_account(handle)
+
+
+def test_annotate_and_store_degraded_path_leaves_hook_fields_null_when_sources_unusable():
+    """If the raw transcript/shots are missing or malformed we can't derive,
+    and falling back to Gemini's independent hook answers would reintroduce
+    the second source of truth — so the derived columns stay NULL (the raw
+    answers are still in raw_gemini_response)."""
+    handle = f"test_annot_degraded_null_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(handle)
+    try:
+        account_id = add_watched_account("tiktok", handle)
+        item_id = _insert_item(account_id, "/fake/path/8888.mp4")
+        bad_raw = _good_v4_dict(shot_breakdown=[{"start_sec": 0.0, "color_palette": "warm"}])
+        del bad_raw["full_transcript"]
+        result = gemini_watcher.AnnotationResult(
+            annotation=None, raw_response=bad_raw, validation_error="bad shots")
+
+        with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result):
+            dna_id = annotate_and_store(item_id)
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT hook_type, hook_text, visual_hook_description, raw_gemini_response
+                       FROM external_creative_dna WHERE id = %s""",
+                    (dna_id,),
+                )
+                hook_type, hook_text, visual, raw_response = cur.fetchone()
+        finally:
+            conn.close()
+
+        assert hook_type == "question"
+        assert hook_text is None
+        assert visual is None
+        assert raw_response == bad_raw
     finally:
         _cleanup_account(handle)

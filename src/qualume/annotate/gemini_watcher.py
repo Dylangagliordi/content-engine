@@ -9,23 +9,31 @@ qualitative only (Gemini samples video at 1 FPS, so exact cut counts are
 unreliable). v3 adds per-shot visual composition and the full spoken
 transcript, aiming for enough structured detail that a new video could be
 briefed as stylistically/structurally equivalent — not just a similar hook.
+v4 stops storing Gemini's independent hook_text/visual_hook_description
+(derived in Python from the transcript/shots instead — see
+derive_hook_fields) and makes per-shot color/setting queryable.
 """
 import json
 import os
 import time
-from typing import NamedTuple
+from typing import NamedTuple, TypeVar
 
 from google import genai
 from google.genai import types
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from qualume import config  # noqa: F401 — loads .env into os.environ
 from qualume.db.connection import get_connection
 from psycopg2.extras import Json
 
-from qualume.models.contracts import ExternalVideoAnnotationV3
+from qualume.models.contracts import (
+    ExternalVideoAnnotationV4,
+    ScriptBeat,
+    ShotBreakdownV4,
+    TranscriptSegment,
+)
 
-ANALYSIS_PROMPT_VERSION = "v3"
+ANALYSIS_PROMPT_VERSION = "v4"
 
 # gemini-3.8-flash is the newest/most capable and real on this key, but is
 # returning persistent 503 ServerError specifically on video input as of
@@ -78,7 +86,8 @@ direct-to-camera, whispered ASMR, fast-talking hype, text-to-speech, no voice).
 Timestamped fields. All times are seconds from the start of the video \
 (decimals allowed); every list must be in chronological order.
 - script_structure_timeline: the same beats as script_structure_tags, each \
-with start_sec and end_sec, covering the video from start to end.
+with start_sec and end_sec, covering the video from start to end. Name the \
+opening scroll-stopping beat exactly "hook".
 - on_screen_text: every distinct piece of text shown on screen (captions, \
 titles, overlays, stickers, labels), transcribed verbatim, each with the \
 timestamp_sec it first appears. Do not include spoken words that are not \
@@ -104,10 +113,14 @@ covering the whole video start to end (no gaps). For each shot give: \
 start_sec, end_sec, shot_type (e.g. close_up, medium_shot, wide_shot, \
 extreme_close_up, pov), camera_movement (e.g. static, handheld, pan, \
 zoom_in, zoom_out, tracking), setting (where it takes place, e.g. kitchen, \
-bedroom, outdoor park), color_palette (dominant colors observed, named not \
-hex, e.g. "warm pinks and whites", "muted earth tones"), lighting (e.g. \
-bright_natural, dim, backlit, studio, golden_hour), and subject_action (what \
-the person/subject is doing, one short phrase). A beat from \
+bedroom, outdoor park), setting_category (exactly one of: home_indoor, \
+home_outdoor, studio, public_indoor, public_outdoor, vehicle, other), \
+color_temperature (exactly one of: warm, cool, neutral, mixed), \
+dominant_colors (one or more basic color names, most dominant first, ONLY \
+from: red, orange, yellow, green, blue, purple, pink, brown, black, white, \
+gray, beige — e.g. ["pink", "white"]), lighting (e.g. bright_natural, dim, \
+backlit, studio, golden_hour), and subject_action (what the person/subject \
+is doing, one short phrase). A beat from \
 script_structure_timeline can span multiple shots if the camera setup \
 changes within it.
 - full_transcript: every spoken utterance in the video, in chronological \
@@ -117,8 +130,85 @@ the opening few seconds. Empty list if there is no speech.
 """
 
 
+# Used when no beat is literally named "hook" (Gemini names beats freely,
+# e.g. "cold_open"/"problem"). Matches the "first ~3 seconds" the prompt has
+# always used to define the hook, so this degrades gracefully rather than
+# failing a whole annotation over a beat label.
+HOOK_FALLBACK_WINDOW_SEC = (0.0, 3.0)
+
+
+def _hook_window(timeline: list[ScriptBeat]) -> tuple[float, float]:
+    for beat in timeline:
+        if beat.beat.strip().lower() == "hook":
+            return beat.start_sec, beat.end_sec
+    return HOOK_FALLBACK_WINDOW_SEC
+
+
+def _shot_phrase(shot: ShotBreakdownV4) -> str:
+    kind = shot.shot_type.replace("_", " ").strip().removesuffix(" shot")
+    article = "An" if kind[:1].lower() in "aeiou" else "A"
+    return f"{article} {kind} shot"
+
+
+def derive_hook_fields(
+    timeline: list[ScriptBeat],
+    transcript: list[TranscriptSegment],
+    shots: list[ShotBreakdownV4],
+) -> tuple[str, str]:
+    """Return (hook_text, visual_hook_description) derived deterministically
+    from the hook window — the single source of truth for the stored values.
+
+    Gemini answers hook_text/visual_hook_description itself too, but those
+    independent answers drifted from its own full_transcript on real output
+    (dropped "I found the perfect one"), so they're never stored.
+
+    Window: the beat named "hook" in script_structure_timeline, else the
+    first 3 seconds. hook_text: every transcript segment whose start_sec is in
+    [start, end), space-joined in order ("" if none). visual: the first shot
+    overlapping the window, plus a note of the cut if more shots overlap
+    ("" if none)."""
+    start, end = _hook_window(timeline)
+
+    segments = sorted(transcript, key=lambda t: t.start_sec)
+    hook_text = " ".join(
+        t.text.strip() for t in segments if start <= t.start_sec < end and t.text.strip()
+    )
+
+    overlapping = [
+        s for s in sorted(shots, key=lambda s: s.start_sec)
+        if s.start_sec < end and s.end_sec > start
+    ]
+    if not overlapping:
+        return hook_text, ""
+    first = overlapping[0]
+    visual = f"{_shot_phrase(first)} in {first.setting.strip()}: {first.subject_action.strip().rstrip('.')}."
+    if len(overlapping) > 1:
+        nxt = overlapping[1]
+        lead = (
+            "Then cuts to" if len(overlapping) == 2
+            else f"Then cuts through {len(overlapping) - 1} more shots, starting with"
+        )
+        phrase = _shot_phrase(nxt)
+        visual += f" {lead} {phrase[0].lower()}{phrase[1:]}: {nxt.subject_action.strip().rstrip('.')}."
+    return hook_text, visual
+
+
+_M = TypeVar("_M", bound=BaseModel)
+
+
+def _parse_raw_list(model: type[_M], items) -> list[_M] | None:
+    """Best-effort parse of one raw list for the degraded path; None if it's
+    missing or any entry doesn't fit (we don't guess at partial data)."""
+    if not isinstance(items, list):
+        return None
+    try:
+        return [model.model_validate(i) for i in items]
+    except ValidationError:
+        return None
+
+
 class AnnotationResult(NamedTuple):
-    annotation: ExternalVideoAnnotationV3 | None  # None if schema validation failed
+    annotation: ExternalVideoAnnotationV4 | None  # None if schema validation failed
     raw_response: dict  # complete parsed Gemini response, including unmapped keys —
                          # ALWAYS populated when Gemini returned anything parseable,
                          # even if `annotation` is None. Nothing gets silently dropped.
@@ -167,7 +257,7 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
             contents=[video, ANNOTATION_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotationV3,
+                response_schema=ExternalVideoAnnotationV4,
             ),
         )
         # Validate the raw text ourselves: the SDK's response.parsed silently
@@ -180,7 +270,7 @@ def annotate_video(local_video_path: str) -> AnnotationResult:
                 f"Gemini response for {local_video_path} is not a JSON object: {response.text[:200]}"
             )
         try:
-            annotation = ExternalVideoAnnotationV3.model_validate(raw_response)
+            annotation = ExternalVideoAnnotationV4.model_validate(raw_response)
             return AnnotationResult(annotation=annotation, raw_response=raw_response)
         except ValidationError as e:
             # Don't lose the raw response just because our strict schema (e.g.
@@ -204,7 +294,11 @@ def annotate_and_store(external_content_item_id: str) -> str:
     and validation_error are populated, every typed field we can pull
     straight out of the raw dict (best-effort, no re-validation) is filled,
     and anything we genuinely can't trust stays NULL. Nothing is silently
-    discarded just because one field didn't fit the strict model."""
+    discarded just because one field didn't fit the strict model.
+
+    hook_text / visual_hook_description are ALWAYS the derive_hook_fields
+    values, never Gemini's independent answers (those stay only in
+    raw_gemini_response)."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -229,9 +323,13 @@ def annotate_and_store(external_content_item_id: str) -> str:
 
         if ann is not None:
             # Clean path: fully validated against the strict schema.
+            # Override Gemini's own hook answers with the derived ones.
+            hook_text, visual_hook_description = derive_hook_fields(
+                ann.script_structure_timeline, ann.full_transcript, ann.shot_breakdown
+            )
             values = dict(
-                hook_type=ann.hook_type, hook_text=ann.hook_text,
-                visual_hook_description=ann.visual_hook_description, format_tag=ann.format_tag,
+                hook_type=ann.hook_type, hook_text=hook_text,
+                visual_hook_description=visual_hook_description, format_tag=ann.format_tag,
                 script_structure_tags=ann.script_structure_tags, cta_type=ann.cta_type,
                 caption_style=ann.caption_style, social_proof_used=ann.social_proof_used,
                 energy_level=ann.energy_level, tone_category=ann.tone_category,
@@ -250,9 +348,22 @@ def annotate_and_store(external_content_item_id: str) -> str:
             def _raw(key, default=None):
                 return raw_response.get(key, default)
 
+            # Derive the hook fields best-effort from the raw lists. A bad
+            # timeline just means the 3s fallback window; an unusable
+            # transcript/shots means NULL — never Gemini's independent
+            # hook_text, which would reintroduce the second source of truth.
+            timeline = _parse_raw_list(ScriptBeat, _raw("script_structure_timeline")) or []
+            transcript = _parse_raw_list(TranscriptSegment, _raw("full_transcript"))
+            shots = _parse_raw_list(ShotBreakdownV4, _raw("shot_breakdown"))
+            hook_text = visual_hook_description = None
+            if transcript is not None:
+                hook_text = derive_hook_fields(timeline, transcript, [])[0]
+            if shots is not None:
+                visual_hook_description = derive_hook_fields(timeline, [], shots)[1]
+
             values = dict(
-                hook_type=_raw("hook_type"), hook_text=_raw("hook_text"),
-                visual_hook_description=_raw("visual_hook_description"),
+                hook_type=_raw("hook_type"), hook_text=hook_text,
+                visual_hook_description=visual_hook_description,
                 format_tag=_raw("format_tag"),
                 script_structure_tags=_raw("script_structure_tags") or [],
                 cta_type=_raw("cta_type"), caption_style=_raw("caption_style"),
