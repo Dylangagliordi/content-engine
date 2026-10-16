@@ -22,7 +22,11 @@ Session history/decisions: `docs/session-context.md`.
 - Postgres 17 (via Docker/OrbStack) for all state — 11 tables as of this writing, see
   `src/qualume/db/migrations/*.sql` for schema
 - n8n (via Docker) for scheduling/orchestration — not yet wired up to anything real
-- Claude only (Anthropic) — no OpenAI/Gemini. Model tiers via `src/qualume/llm/pick_llm.py`
+- Claude only (Anthropic) — no OpenAI/Gemini, with ONE deliberate, scoped exception: Gemini
+  (`google-genai`, `GEMINI_API_KEY` in `.env`) is used only for video-watching annotation in
+  `src/qualume/annotate/gemini_watcher.py` (native audio+video understanding — see
+  `plans/learn-engine-idea-sourcing-architecture.md`). Intentional, not an inconsistency to "fix".
+  Everything else stays Claude-only. Model tiers via `src/qualume/llm/pick_llm.py`
   (`low`=haiku, `medium`=sonnet, `high`=opus — verify these model IDs are still current if it's been
   a while: `python -c "import anthropic; print([m.id for m in anthropic.Anthropic().models.list().data])"`)
 - `yt-dlp` for TikTok content reading (no login required, confirmed working)
