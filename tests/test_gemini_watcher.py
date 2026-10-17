@@ -12,8 +12,6 @@ from qualume.models.contracts import (
     ExternalVideoAnnotationV3,
     ExternalVideoAnnotationV4,
     ExternalVideoAnnotationV5,
-    MAX_SHOT_SECONDS,
-    MAX_TRANSCRIPT_SEGMENT_SECONDS,
     ScriptBeat,
     ShotBreakdown,
     ShotBreakdownV4,
@@ -131,9 +129,11 @@ V5_VIDEO_DURATION = 17  # matches _good_v5_dict's timeline end
 
 
 def _good_v5_dict(**overrides):
-    # v5's shape is v4's, but finely segmented enough to pass v5's
-    # granularity ceilings (v4's fixture has an 11.5s shot and 14s of
-    # trailing transcript, both of which v5 deliberately rejects).
+    # v5's shape is identical to v4's — finely-segmented data here just
+    # reflects realistic output, not a validation requirement (v5 has no
+    # extra validators beyond v4; see ExternalVideoAnnotationV5's
+    # docstring in contracts.py for why the originally-planned duration
+    # ceilings were removed).
     data = _good_v2_dict(
         shot_breakdown=[
             _shot(0.0, 2.5, subject_action="opening a jar"),
@@ -394,9 +394,18 @@ def test_prompt_describes_v4_shot_fields_and_their_vocabularies():
 
 
 def _real_bug_32s_dict():
-    """The real v4 run: shots/beats correctly cover a 32s video, but
-    full_transcript collapsed into ONE segment at 0.0 covering everything —
-    so derive_hook_fields attributed the whole script to the hook."""
+    """The real v4 run that prompted v5: shots/beats correctly cover a 32s
+    video, but full_transcript collapsed into ONE segment at 0.0 covering
+    everything — so derive_hook_fields attributed the whole script to the
+    hook. v5 originally added a hard duration-ceiling validator to reject
+    shapes like this, but real rejected rows during the 58-video batch
+    turned out to be legitimate long single takes/sentences (a 60s
+    unbroken talking-head shot, a 9-word/9-second sentence) — duration
+    alone can't tell those apart from genuine merging, so the ceiling was
+    removed rather than kept as a false-positive source. v5 therefore
+    accepts this shape too now, same as v4 — the fix for THIS specific
+    failure mode is the prompt wording asking Gemini not to merge
+    sentences/cuts, not a contract-level validator."""
     return _good_v5_dict(
         script_structure_timeline=[
             {"beat": "hook", "start_sec": 0.0, "end_sec": 3.0},
@@ -408,67 +417,47 @@ def _real_bug_32s_dict():
     )
 
 
-def test_v5_rejects_one_transcript_segment_spanning_the_whole_video():
-    """Exact reproduction of the real v4 bug."""
+def test_v5_has_no_extra_validation_beyond_v4():
+    """v5 is the same schema/validation as v4 — see _real_bug_32s_dict's
+    docstring for why the duration-ceiling validator was removed rather
+    than kept. v5's actual changes are prompt wording (tested separately
+    below) and the coverage check (tested further down)."""
     raw = _real_bug_32s_dict()
-    ExternalVideoAnnotationV4(**raw)  # v4 accepted it — that's the bug
-    with pytest.raises(ValidationError, match="full_transcript"):
-        ExternalVideoAnnotationV5(**raw)
+    ExternalVideoAnnotationV4(**raw)
+    ExternalVideoAnnotationV5(**raw)  # no longer raises
 
 
-def test_v5_rejects_an_overlong_transcript_segment_in_the_middle():
-    raw = _good_v5_dict(full_transcript=[
-        {"start_sec": 0.0, "text": "a"},
-        {"start_sec": 2.0, "text": "b — then nothing until 11.5"},  # spans 9.5s
-        {"start_sec": 11.5, "text": "c"},
-    ])
-    with pytest.raises(ValidationError, match="full_transcript"):
-        ExternalVideoAnnotationV5(**raw)
-
-
-def test_v5_accepts_transcript_segments_all_under_the_ceiling():
-    ann = ExternalVideoAnnotationV5(**_good_v5_dict())
-    assert len(ann.full_transcript) == 4
-
-
-def test_v5_transcript_ceiling_is_inclusive():
-    # last segment at 9.0, annotation ends at 17.0 -> exactly the ceiling
-    assert MAX_TRANSCRIPT_SEGMENT_SECONDS == 8.0
-    raw = _good_v5_dict(full_transcript=[
-        {"start_sec": 0.0, "text": "a"}, {"start_sec": 5.0, "text": "b"},
-        {"start_sec": 9.0, "text": "c"},
-    ])
+def test_v5_accepts_a_single_long_unbroken_shot():
+    """A real finding from the 58-video batch: a 60s single static
+    talking-head shot with zero cuts is ordinary content, not a merging
+    bug — v5 must not reject it."""
+    raw = _good_v5_dict(shot_breakdown=[_shot(0.0, 60.0)])
     ExternalVideoAnnotationV5(**raw)
 
 
-def test_v5_allows_empty_transcript():
-    """A silent video legitimately has no speech."""
-    assert ExternalVideoAnnotationV5(**_good_v5_dict(full_transcript=[])).full_transcript == []
-
-
-def test_v5_rejects_a_single_shot_that_is_too_long():
-    raw = _good_v5_dict(shot_breakdown=[_shot(0.0, 2.5), _shot(2.5, 17.0)])  # 14.5s shot
-    with pytest.raises(ValidationError, match="shot_breakdown"):
-        ExternalVideoAnnotationV5(**raw)
-
-
-def test_v5_shot_ceiling_is_inclusive():
-    assert MAX_SHOT_SECONDS == 10.0
-    ExternalVideoAnnotationV5(**_good_v5_dict(shot_breakdown=[_shot(0.0, 10.0), _shot(10.0, 17.0)]))
+def test_v5_accepts_a_single_long_sentence():
+    """Another real finding: a genuinely long single sentence (slightly
+    fast speech, not several sentences glued together) is ordinary
+    content — v5 must not reject it."""
+    raw = _good_v5_dict(full_transcript=[{"start_sec": 0.0, "text": "a" * 200}])
+    ExternalVideoAnnotationV5(**raw)
 
 
 def test_v5_extends_v4_without_changing_it():
     """v4 must still validate the already-stored real v4 row's shape —
-    v5's stricter rules live only on the new class."""
+    and so must v5, since it adds no stricter rules on top."""
     assert issubclass(ExternalVideoAnnotationV5, ExternalVideoAnnotationV4)
     ExternalVideoAnnotationV4(**_good_v4_dict())
-    with pytest.raises(ValidationError):
-        ExternalVideoAnnotationV5(**_good_v4_dict())  # 11.5s shot
+    ExternalVideoAnnotationV5(**_good_v4_dict())  # same shape, no longer rejected
 
 
-def test_prompt_demands_fine_segmentation():
-    for phrase in ["sentence", "camera cut", "do not merge", "8 seconds", "10 seconds"]:
+def test_prompt_asks_for_fine_segmentation_without_a_hard_time_limit():
+    for phrase in ["sentence", "camera cut", "do not merge"]:
         assert phrase in ANNOTATION_PROMPT.lower(), f"ANNOTATION_PROMPT never mentions {phrase!r}"
+    # v5 removed the "no more than N seconds" wording — a real long single
+    # take/sentence is legitimate and shouldn't be instructed against.
+    for phrase in ["no entry may cover more than 8 seconds", "no single shot entry may last longer than 10 seconds"]:
+        assert phrase not in ANNOTATION_PROMPT.lower()
 
 
 # --- coverage check ------------------------------------------------------------
@@ -528,6 +517,17 @@ def test_coverage_flags_transcript_ending_far_before_the_video_does():
 
 def test_coverage_does_not_flag_an_empty_transcript():
     ann = ExternalVideoAnnotationV5(**_good_v5_dict(full_transcript=[]))
+    assert _check_coverage(ann, V5_VIDEO_DURATION) == []
+
+
+def test_coverage_tolerates_normal_trailing_silence_before_a_video_ends():
+    """Regression test: a real false positive found right after building
+    this check — _good_v5_dict's last transcript segment starts at 12.0s
+    in a 17s video (5.0s of trailing silence, e.g. a lingering shot or
+    on-screen-text CTA with no speech). That's ordinary content, not an
+    incomplete transcript, and must not be flagged. Caught because it's
+    the SAME fixture used elsewhere as the 'fully covered' baseline."""
+    ann = ExternalVideoAnnotationV5(**_good_v5_dict())
     assert _check_coverage(ann, V5_VIDEO_DURATION) == []
 
 
@@ -734,19 +734,23 @@ def test_annotate_video_reports_incomplete_coverage_without_failing(gemini_key, 
     assert "shot_breakdown" in result.coverage_warning
 
 
-def test_annotate_video_routes_the_real_collapsed_transcript_bug_to_the_degraded_path(
+def test_annotate_video_accepts_the_formerly_rejected_collapsed_transcript_shape(
         gemini_key, fake_video):
-    """The granularity check is a real ValidationError, so it goes through
-    the existing graceful path: annotation None, raw response kept."""
+    """_real_bug_32s_dict() used to be a real ValidationError (one
+    transcript segment spanning the whole 32s video). After the ceiling
+    validator was removed (see its docstring), this shape now validates
+    cleanly, same as any other v5 annotation — derive_hook_fields will
+    still attribute the whole script to the hook here (that's a known,
+    separate limitation of time-window-based derivation on under-detailed
+    transcripts, not something this test asserts against)."""
     raw = _real_bug_32s_dict()
     client = _mock_client(json.dumps(raw))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         result = annotate_video(fake_video, 32)
-    assert result.annotation is None
-    assert "full_transcript" in result.validation_error
+    assert result.annotation is not None
+    assert result.validation_error is None
     assert result.raw_response == raw
-    assert result.coverage_warning is None  # nothing validated to check coverage of
 
 
 def test_annotate_video_keeps_full_raw_response_including_unmapped_keys(gemini_key, fake_video):
@@ -1033,58 +1037,11 @@ def test_annotate_and_store_degraded_path_leaves_hook_fields_null_when_sources_u
         _cleanup_account(handle)
 
 
-def test_annotate_and_store_degraded_path_rejects_the_real_bug_transcript():
-    """Regression test for the actual bug found running v4 live twice on the
-    same video: Gemini collapsed the whole video's speech into ONE
-    TranscriptSegment (individually valid — nothing wrong with a single
-    segment on its own) instead of 8 properly-segmented ones. Each item
-    parses fine, so the raw list passes _parse_raw_list, but it violates the
-    SAME granularity ceiling ExternalVideoAnnotationV5 enforces at the
-    list level. Before the fix, the degraded path still derived hook_text
-    from this oversized segment, since it only checked 'did it parse',
-    not 'is it granular enough' — silently reintroducing the exact bug
-    v5's validator exists to catch, just via the degraded path instead of
-    the happy path."""
-    handle = f"test_annot_degraded_bug_{uuid.uuid4().hex[:8]}"
-    _cleanup_account(handle)
-    try:
-        account_id = add_watched_account("tiktok", handle)
-        item_id = _insert_item(account_id, "/fake/path/7670137194773826847.mp4")
-        bad_raw = _good_v5_dict(
-            full_transcript=[
-                # One segment covering the ENTIRE video — this is exactly
-                # what Gemini actually returned on the real re-run.
-                {"start_sec": 0.0, "text": (
-                    "Okay, if y'all have been looking for a daily immune "
-                    "support for your children, I found the perfect one. "
-                    "This is from Wish Gardens."
-                )},
-            ],
-            energy_level=9,  # also fails validation, for an unrelated reason —
-                              # the point is the transcript check specifically
-        )
-        result = gemini_watcher.AnnotationResult(
-            annotation=None, raw_response=bad_raw, validation_error="too many problems"
-        )
-
-        with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result):
-            dna_id = annotate_and_store(item_id)
-
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT hook_text, raw_gemini_response FROM external_creative_dna WHERE id = %s",
-                    (dna_id,),
-                )
-                hook_text, raw_response = cur.fetchone()
-        finally:
-            conn.close()
-
-        # The real bug: this used to be the ENTIRE 3-sentence transcript,
-        # attributed to the hook. Now it must be NULL — not derived from an
-        # under-segmented source, even though every individual item parsed.
-        assert hook_text is None
-        assert raw_response == bad_raw  # still nothing lost
-    finally:
-        _cleanup_account(handle)
+# NOTE: the degraded-path granularity gate that used to live here
+# (_shots_granularity_ok / _transcript_granularity_ok, blocking hook-field
+# derivation from a raw list that individually parsed but violated v5's
+# duration ceiling) was removed along with the ceiling validator itself —
+# see ExternalVideoAnnotationV5's docstring in contracts.py. The degraded
+# path now derives hook fields from whatever raw list parsed, same as
+# before v5 — there's no longer a "too coarse to trust" distinction to
+# test here.

@@ -11,10 +11,16 @@ transcript, aiming for enough structured detail that a new video could be
 briefed as stylistically/structurally equivalent — not just a similar hook.
 v4 stops storing Gemini's independent hook_text/visual_hook_description
 (derived in Python from the transcript/shots instead — see
-derive_hook_fields) and makes per-shot color/setting queryable. v5 rejects
-under-segmented transcripts/shots (contract validators) and records
-coverage gaps against the real video duration. Temperature is left at the
-API default — Google's own Gemini 3 guidance (confirmed live,
+derive_hook_fields) and makes per-shot color/setting queryable. v5 adds
+clearer prompt wording against merging distinct shots/sentences together
+and records coverage gaps against the real video duration (shots/transcript
+stopping short of the video's known duration). An earlier v5 draft also
+hard-rejected any shot/segment over a fixed duration, but real rejected rows
+turned out to be legitimate long single takes and sentences, not merged
+ones — duration alone can't tell those apart, so that check was removed
+rather than kept as a false-positive source; see ExternalVideoAnnotationV5's
+docstring in contracts.py. Temperature is left at the API default —
+Google's own Gemini 3 guidance (confirmed live,
 ai.google.dev/gemini-api/docs/gemini-3) warns lower values risk looping/
 degraded output on Gemini 3 models, which GEMINI_MODEL is.
 """
@@ -33,8 +39,6 @@ from psycopg2.extras import Json
 
 from qualume.models.contracts import (
     ExternalVideoAnnotationV5,
-    MAX_SHOT_SECONDS,
-    MAX_TRANSCRIPT_SEGMENT_SECONDS,
     ScriptBeat,
     ShotBreakdownV4,
     TranscriptSegment,
@@ -72,14 +76,22 @@ GEMINI_TEMPERATURE = None  # None = use the SDK/API default, not a override
 # flagged in coverage_warning. Small gaps are normal Gemini timestamp slop.
 MAX_COVERAGE_GAP_SECONDS = 3.0
 
+# Separate, more generous tolerance for trailing silence after the last
+# transcript segment: a video can legitimately go quiet for several seconds
+# before it ends (lingering shot, on-screen-text-only CTA, outro music) —
+# that's not "Gemini stopped transcribing early", so it needs a looser
+# threshold than the between-shots gap check above.
+MAX_TRANSCRIPT_TRAILING_SILENCE_SECONDS = 8.0
+
 FILE_POLL_INTERVAL_SECONDS = 2
 FILE_POLL_TIMEOUT_SECONDS = 300
 
-# v5's segmentation wording (shot_breakdown / full_transcript) is a nudge, not
-# a guarantee — v4 already asked for "every" shot/utterance and still got one
-# collapsed segment. ExternalVideoAnnotationV5's validators are the real
-# backstop; the 10s / 8s figures below mirror MAX_SHOT_SECONDS /
-# MAX_TRANSCRIPT_SEGMENT_SECONDS — keep them in sync.
+# v5's segmentation wording asks for one entry per real cut/sentence and NOT
+# to merge distinct ones together, but explicitly allows genuinely long single
+# takes/sentences — v5 originally also had hard duration ceilings enforcing
+# this as a contract validator, removed after real rejected rows turned out
+# to be legitimate long single shots/sentences, not merged ones. See
+# ExternalVideoAnnotationV5's docstring in contracts.py for the full story.
 ANNOTATION_PROMPT = """\
 You are annotating a short-form social video (TikTok) for a content-pattern \
 research database. Watch the whole video, using BOTH the visuals and the audio \
@@ -144,9 +156,9 @@ visual style and structure without rewatching this one.
 the whole video start to end (no gaps). Every time the picture cuts to a new \
 shot, angle, framing or setting, start a new entry — even if the setting is \
 the same and the cut is only a second long. Do NOT merge several cuts into \
-one entry. No single shot entry may last longer than 10 seconds; if one \
-continuous take really is longer, split it at a change in framing or action. \
-For each shot give: \
+one entry. A single unbroken take (e.g. one person talking to camera with \
+no cuts) is real and should be reported as ONE long entry — don't \
+artificially split a shot that genuinely has no cut in it. For each shot give: \
 start_sec, end_sec, shot_type (e.g. close_up, medium_shot, wide_shot, \
 extreme_close_up, pov), camera_movement (e.g. static, handheld, pan, \
 zoom_in, zoom_out, tracking), setting (where it takes place, e.g. kitchen, \
@@ -164,9 +176,10 @@ changes within it.
 verbatim, as ONE ENTRY PER SENTENCE (or per short phrase if the speaker \
 doesn't use full sentences), each with the start_sec that sentence begins. \
 Do NOT merge multiple sentences into one entry, and never return the whole \
-transcript as a single entry. No entry may cover more than 8 seconds \
-of the video. A typical 30-second talking video has roughly 6-12 entries. \
-This is the COMPLETE transcript, not just the hook — include everything said, \
+transcript as a single entry. A single genuinely long sentence is fine as \
+one entry — the point is not merging separate sentences together, not \
+hitting a time limit. A typical 30-second talking video has roughly 6-12 \
+entries. This is the COMPLETE transcript, not just the hook — include everything said, \
 through to the end of the video. Empty list if there is no speech.
 """
 
@@ -189,33 +202,6 @@ def _shot_phrase(shot: ShotBreakdownV4) -> str:
     kind = shot.shot_type.replace("_", " ").strip().removesuffix(" shot")
     article = "An" if kind[:1].lower() in "aeiou" else "A"
     return f"{article} {kind} shot"
-
-
-def _shots_granularity_ok(shots: list[ShotBreakdownV4]) -> bool:
-    """Same per-shot span check as ExternalVideoAnnotationV5._v5_granularity,
-    reused on the degraded path so a raw shot list that would fail the full
-    contract's validator (but parses fine item-by-item) doesn't still get
-    derived into visual_hook_description — see the comment at its call site
-    in annotate_and_store for why this matters."""
-    return all(s.end_sec - s.start_sec <= MAX_SHOT_SECONDS for s in shots)
-
-
-def _transcript_granularity_ok(
-    transcript: list[TranscriptSegment],
-    timeline: list[ScriptBeat],
-    shots: list[ShotBreakdownV4] | None,
-) -> bool:
-    """Same per-segment span check as ExternalVideoAnnotationV5._v5_granularity
-    (mirrors its bounds logic: the last segment's end is the latest known
-    shot/beat end_sec), reused on the degraded path for the same reason as
-    _shots_granularity_ok above."""
-    starts = sorted(t.start_sec for t in transcript)
-    ends = [b.end_sec for b in timeline] + [s.end_sec for s in (shots or [])]
-    bounds = starts[1:] + ([max(ends)] if ends else [])
-    return all(
-        next_start - start <= MAX_TRANSCRIPT_SEGMENT_SECONDS
-        for start, next_start in zip(starts, bounds)
-    )
 
 
 def derive_hook_fields(
@@ -294,11 +280,12 @@ def _check_coverage(
         warnings.append(f"shot_breakdown runs to {covered_until}s, past the real {duration:g}s video end")
 
     # Empty transcript is legitimate (silent video), so only a non-empty one
-    # that stops early is flagged — same ceiling the contract uses between
-    # segments, now measured against the real end instead of Gemini's own.
+    # that stops early is flagged — uses its own, more generous tolerance
+    # than the shot-gap check above, since trailing silence before a video
+    # ends is normal (lingering shot, on-screen CTA, outro music).
     if annotation.full_transcript:
         last = max(t.start_sec for t in annotation.full_transcript)
-        if duration - last > MAX_TRANSCRIPT_SEGMENT_SECONDS:
+        if duration - last > MAX_TRANSCRIPT_TRAILING_SILENCE_SECONDS:
             warnings.append(
                 f"full_transcript's last segment starts at {last}s of a {duration:g}s video "
                 f"({duration - last:.1f}s with no new segment)"
@@ -477,21 +464,17 @@ def annotate_and_store(external_content_item_id: str) -> str:
 
             # Derive the hook fields best-effort from the raw lists — but
             # only if those lists individually pass the SAME granularity
-            # ceilings ExternalVideoAnnotationV5 enforces. Otherwise a
-            # structurally-valid-per-item but under-segmented list (e.g. the
-            # real bug: one TranscriptSegment spanning the whole 32s video —
-            # each item is individually valid, only the list-level span
-            # check rejects it) would still get derived into a bad hook_text
-            # on the degraded path, silently reintroducing the exact issue
-            # v5's validator exists to catch. NULL is correct here — the
-            # row's validation_error already explains why.
+            # Derive the hook fields best-effort from the raw lists. A bad
+            # timeline just means the 3s fallback window; an unusable
+            # transcript/shots means NULL — never Gemini's independent
+            # hook_text, which would reintroduce the second source of truth.
             timeline = _parse_raw_list(ScriptBeat, _raw("script_structure_timeline")) or []
             transcript = _parse_raw_list(TranscriptSegment, _raw("full_transcript"))
             shots = _parse_raw_list(ShotBreakdownV4, _raw("shot_breakdown"))
             hook_text = visual_hook_description = None
-            if transcript is not None and _transcript_granularity_ok(transcript, timeline, shots):
+            if transcript is not None:
                 hook_text = derive_hook_fields(timeline, transcript, [])[0]
-            if shots is not None and _shots_granularity_ok(shots):
+            if shots is not None:
                 visual_hook_description = derive_hook_fields(timeline, [], shots)[1]
 
             values = dict(

@@ -217,53 +217,24 @@ class ExternalVideoAnnotationV4(ExternalVideoAnnotationV3):
     shot_breakdown: list[ShotBreakdownV4] = Field(description="Every distinct camera shot, in order, covering the whole video")
 
 
-# v5 granularity ceilings. Exceeding either means Gemini under-segmented
-# (real v4 run: the full 32s transcript collapsed into ONE segment at 0.0).
-# Tunable — if real videos with long pauses / single long takes trip these
-# legitimately, raise them rather than deleting the check.
-MAX_TRANSCRIPT_SEGMENT_SECONDS = 8.0
-MAX_SHOT_SECONDS = 10.0
-
-
 class ExternalVideoAnnotationV5(ExternalVideoAnnotationV4):
-    """v5 adds hard granularity checks. v4's prompt already asked for every
-    utterance/shot, yet a re-run on the same video returned the whole 32s
-    transcript as one segment — prompt wording alone can't force fine
-    segmentation, so these validators are the actual backstop. A violation
-    is a real ValidationError, i.e. the existing degraded path in
-    annotate_and_store (raw_gemini_response kept, typed lists NULL).
-
-    A transcript segment's span is the next segment's start_sec minus its
-    own; the last one runs to the annotation's own end (latest shot/beat
-    end_sec) since the contract doesn't know the real video duration —
-    gemini_watcher._check_coverage compares against that separately.
-    Shots carry their own end_sec, so a shot's span is just end - start.
-
-    Same fields/schema as v4, so v4's stored row is unaffected."""
-
-    @model_validator(mode="after")
-    def _v5_granularity(self):
-        for shot in self.shot_breakdown:
-            if shot.end_sec - shot.start_sec > MAX_SHOT_SECONDS:
-                raise ValueError(
-                    f"shot_breakdown has a {shot.end_sec - shot.start_sec:.1f}s shot "
-                    f"({shot.start_sec}-{shot.end_sec}), over the {MAX_SHOT_SECONDS}s "
-                    "ceiling — likely several camera cuts merged into one"
-                )
-
-        ends = [s.end_sec for s in self.shot_breakdown] + [b.end_sec for b in self.script_structure_timeline]
-        starts = [t.start_sec for t in self.full_transcript]
-        # No shots/beats -> no known end, so the last segment can't be measured.
-        bounds = starts[1:] + ([max(ends)] if ends else [])
-        for start, next_start in zip(starts, bounds):
-            if next_start - start > MAX_TRANSCRIPT_SEGMENT_SECONDS:
-                raise ValueError(
-                    f"full_transcript segment starting at {start}s spans "
-                    f"{next_start - start:.1f}s (to {next_start}s), over the "
-                    f"{MAX_TRANSCRIPT_SEGMENT_SECONDS}s ceiling — likely several "
-                    "sentences merged into one segment"
-                )
-        return self
+    """v5 originally added hard duration ceilings on shot_breakdown/
+    full_transcript (reject anything over ~8-10s as 'under-segmented').
+    Removed after reviewing real rejected rows: a 60s single static
+    talking-head shot and a 9-word, 9-second sentence are both completely
+    ordinary content, not merged segments — duration alone can't tell
+    real long takes/sentences apart from actual under-segmentation, so the
+    check was rejecting good data, which violates this project's
+    never-silently-discard-real-data rule. The real v4 bug (one segment
+    spanning the ENTIRE 32s script, several complete sentences glued
+    together) had a different, actually-distinguishing signature —
+    multiple sentence-ending punctuation marks inside one segment — which
+    could be a future, better-targeted check if this recurs, but isn't
+    built here. For now: same fields/schema as v4, no extra validation.
+    coverage_warning (gemini_watcher._check_coverage) still separately
+    flags shots/transcript that stop short of the real video duration —
+    that check is about completeness, not segment length, and stays."""
+    pass
 
 
 class CampaignBrief(BaseModel):
