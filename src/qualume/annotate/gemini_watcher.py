@@ -462,8 +462,6 @@ def annotate_and_store(external_content_item_id: str) -> str:
             def _raw(key, default=None):
                 return raw_response.get(key, default)
 
-            # Derive the hook fields best-effort from the raw lists — but
-            # only if those lists individually pass the SAME granularity
             # Derive the hook fields best-effort from the raw lists. A bad
             # timeline just means the 3s fallback window; an unusable
             # transcript/shots means NULL — never Gemini's independent
