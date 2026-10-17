@@ -11,7 +11,7 @@ def test_run_poll_cycle_handles_empty_watchlist(mock_list):
         "accounts_polled": 0,
         "accounts_failed": 0,
         "new_videos": 0,
-        "skipped_duplicates": 0,
+        "refreshed_snapshots": 0,
     }
 
 
@@ -28,7 +28,7 @@ def test_run_poll_cycle_isolates_one_account_failure_from_others(mock_sleep, moc
     def side_effect(account_id, handle, max_videos=30):
         if handle == "broken_account":
             raise RuntimeError("simulated scrape failure")
-        return {"new_videos": 1, "skipped_duplicates": 0}
+        return {"new_videos": 1, "refreshed_snapshots": 0}
 
     mock_ingest.side_effect = side_effect
 

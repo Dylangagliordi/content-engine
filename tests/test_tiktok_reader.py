@@ -83,7 +83,7 @@ def test_ingest_videos_for_account_inserts_new_videos(mock_fetch):
         result = ingest_videos_for_account(account_id, handle)
 
         assert result["new_videos"] == 2
-        assert result["skipped_duplicates"] == 0
+        assert result["refreshed_snapshots"] == 0
 
         conn = get_connection()
         try:
@@ -103,8 +103,11 @@ def test_ingest_videos_for_account_inserts_new_videos(mock_fetch):
 @patch("qualume.ingest.tiktok_reader.fetch_account_videos")
 def test_ingest_videos_for_account_dedupes_on_second_run(mock_fetch):
     """Regression test for the core requirement: running the poller twice
-    must not create duplicate rows or duplicate performance snapshots for
-    videos already seen."""
+    must not create a duplicate external_content_items ROW for a video
+    already seen — but (see test_ingest_videos_refreshes_snapshot_for_
+    already_known_video below) it MUST still log a fresh performance
+    snapshot each time, so repeated polling builds a real time series
+    rather than a single frozen number."""
     handle = f"test_dedup_{uuid.uuid4().hex[:8]}"
     _cleanup_account(handle)
     try:
@@ -115,10 +118,12 @@ def test_ingest_videos_for_account_dedupes_on_second_run(mock_fetch):
         assert first_run["new_videos"] == 1
 
         # Second poll sees the same video (TikTok account hasn't posted
-        # anything new) — must be recognized as already-known, not re-inserted.
+        # anything new) — must be recognized as already-known, not
+        # re-inserted as a new CONTENT ITEM (the snapshot IS refreshed —
+        # see the dedicated test for that).
         second_run = ingest_videos_for_account(account_id, handle)
         assert second_run["new_videos"] == 0
-        assert second_run["skipped_duplicates"] == 1
+        assert second_run["refreshed_snapshots"] == 1
 
         conn = get_connection()
         try:
@@ -131,6 +136,49 @@ def test_ingest_videos_for_account_dedupes_on_second_run(mock_fetch):
         finally:
             conn.close()
         assert count == 1, "Duplicate video was inserted on re-poll"
+    finally:
+        _cleanup_account(handle)
+
+
+@patch("qualume.ingest.tiktok_reader.fetch_account_videos")
+def test_ingest_videos_refreshes_snapshot_for_already_known_video(mock_fetch):
+    """Real gap found and fixed: a video already in the DB must still get
+    a NEW performance_snapshots row with its CURRENT numbers on every
+    poll, not be silently skipped. Without this, daily/weekly scheduled
+    polling on an always-on host (the whole point of it) would only ever
+    produce ONE snapshot per video forever — no growth/velocity signal,
+    which is the actual thing scheduled polling is for."""
+    handle = f"test_refresh_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(handle)
+    try:
+        account_id = add_watched_account("tiktok", handle)
+        mock_fetch.return_value = [_fake_entry("555", views=1000)]
+        ingest_videos_for_account(account_id, handle)
+
+        # Simulate time passing: TikTok now reports more views on the SAME
+        # video (its platform_video_id is unchanged).
+        mock_fetch.return_value = [_fake_entry("555", views=5000)]
+        result = ingest_videos_for_account(account_id, handle)
+
+        assert result["new_videos"] == 0
+        assert result["refreshed_snapshots"] == 1
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT eps.views FROM external_performance_snapshots eps
+                       JOIN external_content_items eci ON eci.id = eps.external_content_item_id
+                       WHERE eci.watched_account_id = %s
+                       ORDER BY eps.ts""",
+                    (account_id,),
+                )
+                views_over_time = [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
+        # TWO real snapshots now exist for the SAME video — a real time
+        # series, not one frozen number overwritten or never refreshed.
+        assert views_over_time == [1000, 5000]
     finally:
         _cleanup_account(handle)
 

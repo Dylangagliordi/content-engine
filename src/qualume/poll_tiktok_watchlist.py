@@ -23,16 +23,16 @@ DELAY_BETWEEN_ACCOUNTS_SECONDS = 3
 
 def run_poll_cycle(max_videos: int = DEFAULT_MAX_VIDEOS_PER_ACCOUNT) -> dict:
     accounts = list_watched_accounts(platform="tiktok", active_only=True)
-    summary = {"accounts_polled": 0, "accounts_failed": 0, "new_videos": 0, "skipped_duplicates": 0}
+    summary = {"accounts_polled": 0, "accounts_failed": 0, "new_videos": 0, "refreshed_snapshots": 0}
 
     for i, account in enumerate(accounts):
         try:
             result = ingest_videos_for_account(account["id"], account["handle"], max_videos=max_videos)
             summary["accounts_polled"] += 1
             summary["new_videos"] += result["new_videos"]
-            summary["skipped_duplicates"] += result["skipped_duplicates"]
+            summary["refreshed_snapshots"] += result["refreshed_snapshots"]
             print(f"  @{account['handle']}: {result['new_videos']} new, "
-                  f"{result['skipped_duplicates']} already known")
+                  f"{result['refreshed_snapshots']} refreshed (already known)")
         except Exception as e:
             # Fail loud per-account, don't let one broken/blocked account
             # kill the whole sweep (v2 plan §1.9 — fail loud, fail cheap,
@@ -56,4 +56,4 @@ if __name__ == "__main__":
     print(f"\nDone. Polled {result['accounts_polled']} accounts "
           f"({result['accounts_failed']} failed), "
           f"{result['new_videos']} new videos, "
-          f"{result['skipped_duplicates']} already known.")
+          f"{result['refreshed_snapshots']} refreshed (already known).")

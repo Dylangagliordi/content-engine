@@ -63,6 +63,25 @@ def _insert_video_with_views(account_id, views: int) -> str:
         conn.close()
 
 
+def _add_another_snapshot(item_id: str, views: int):
+    """Simulate a later re-poll of an ALREADY-KNOWN video (same item_id) —
+    the real time-series shape scheduled daily/weekly polling now produces,
+    since ingest_videos_for_account no longer skips already-known videos'
+    performance numbers."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares)
+                   VALUES (%s, %s, 0, 0, 0)""",
+                (item_id, views),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def fake_account():
     handle = f"test_baseline_{uuid.uuid4().hex[:8]}"
@@ -146,3 +165,30 @@ def test_performance_vs_baseline_handles_single_video_account(fake_account):
     result = performance_vs_baseline(item_id)
     assert result["account_median_views"] == 500
     assert result["ratio_to_median"] == 1.0
+
+
+def test_account_median_views_uses_latest_snapshot_per_video_not_every_snapshot(fake_account):
+    """Real bug this would otherwise hit the moment scheduled daily/weekly
+    polling produces a real time series: a video re-polled 5 times (same
+    external_content_item_id, 5 performance_snapshots rows as its view
+    count climbs from a slow start to going viral) must count ONCE in the
+    account median — using its LATEST view count — not FIVE times, which
+    would silently skew the whole account's baseline toward whichever
+    videos happened to get polled most often (an artifact of polling
+    frequency, not a real signal about the account's typical
+    performance)."""
+    account_id, _ = fake_account
+    # one video, polled 5 times as it climbs from a slow start to viral.
+    frequently_polled = _insert_video_with_views(account_id, 50)
+    for views in [60, 70, 80, 5000]:
+        _add_another_snapshot(frequently_polled, views)
+    # two videos polled only once each, at typical levels.
+    _insert_video_with_views(account_id, 100)
+    _insert_video_with_views(account_id, 200)
+
+    # Correct (one value per VIDEO, its latest): median of [5000, 100, 200] = 200.
+    # Buggy (one value per SNAPSHOT): median of [50,60,70,80,5000,100,200]
+    # = 80 - the frequently-polled video's early, low snapshots would
+    # drag the whole account's baseline down just because it got polled
+    # more often, which is exactly the artifact this test catches.
+    assert account_median_views(account_id) == 200

@@ -80,12 +80,20 @@ def parse_video_entry(entry: dict) -> dict:
 
 def ingest_videos_for_account(watched_account_id: str, handle: str,
                                max_videos: int = DEFAULT_MAX_VIDEOS_PER_ACCOUNT) -> dict:
-    """Poll one watched account, dedup against existing rows, insert new
-    videos + their first performance snapshot. Idempotent: running this
-    repeatedly against an unchanged feed inserts nothing new (v2 plan §1.4)."""
+    """Poll one watched account, dedup against existing CONTENT ITEMS (never
+    insert the same video row twice), but log a FRESH performance snapshot
+    on every poll — including for already-known videos. The dedup is on
+    the row identity (platform_video_id), never on the performance numbers:
+    a video seen before still gets a brand-new external_performance_
+    snapshots row with its current view/like/comment/share counts, so
+    scheduled (daily/weekly) polling on an always-on host builds a real
+    time series per video — growth/velocity, not one frozen snapshot
+    forever. (Previously this silently skipped already-known videos
+    entirely, including their performance numbers — a real gap found
+    while planning always-on scheduled polling; see git history.)"""
     entries = fetch_account_videos(handle, max_videos=max_videos)
     new_videos = 0
-    skipped_duplicates = 0
+    refreshed_snapshots = 0
 
     conn = get_connection()
     try:
@@ -101,7 +109,20 @@ def ingest_videos_for_account(watched_account_id: str, handle: str,
                 )
                 existing = cur.fetchone()
                 if existing:
-                    skipped_duplicates += 1
+                    external_content_item_id = existing[0]
+                    cur.execute(
+                        """INSERT INTO external_performance_snapshots
+                           (external_content_item_id, views, likes, comments, shares)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (
+                            external_content_item_id,
+                            parsed["views"],
+                            parsed["likes"],
+                            parsed["comments"],
+                            parsed["shares"],
+                        ),
+                    )
+                    refreshed_snapshots += 1
                     continue
 
                 cur.execute(
@@ -141,7 +162,7 @@ def ingest_videos_for_account(watched_account_id: str, handle: str,
     finally:
         conn.close()
 
-    return {"new_videos": new_videos, "skipped_duplicates": skipped_duplicates}
+    return {"new_videos": new_videos, "refreshed_snapshots": refreshed_snapshots}
 
 
 def _existing_video_file(dest_dir: str, platform_video_id: str) -> str | None:

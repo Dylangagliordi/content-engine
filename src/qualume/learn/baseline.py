@@ -23,7 +23,13 @@ decided here.
 
 def account_median_views(watched_account_id: str) -> int | float | None:
     """Median view count across all of ONE account's videos that have at
-    least one performance snapshot. None if the account has no snapshots
+    least one performance snapshot. Each video counts ONCE, using its
+    LATEST snapshot — not once per snapshot. Without this, a video
+    re-polled many times (the real shape scheduled daily/weekly polling
+    now produces, see ingest_videos_for_account) would skew the median
+    toward whichever videos happened to get polled most often, an
+    artifact of polling frequency rather than a real signal about the
+    account's typical performance. None if the account has no snapshots
     yet (can't baseline against nothing)."""
     from qualume.db.connection import get_connection
 
@@ -31,10 +37,15 @@ def account_median_views(watched_account_id: str) -> int | float | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY eps.views)
-                   FROM external_performance_snapshots eps
-                   JOIN external_content_items eci ON eci.id = eps.external_content_item_id
-                   WHERE eci.watched_account_id = %s AND eps.views IS NOT NULL""",
+                """SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latest.views)
+                   FROM (
+                       SELECT DISTINCT ON (eps.external_content_item_id)
+                              eps.views
+                       FROM external_performance_snapshots eps
+                       JOIN external_content_items eci ON eci.id = eps.external_content_item_id
+                       WHERE eci.watched_account_id = %s AND eps.views IS NOT NULL
+                       ORDER BY eps.external_content_item_id, eps.ts DESC
+                   ) latest""",
                 (watched_account_id,),
             )
             (median,) = cur.fetchone()
