@@ -270,3 +270,66 @@ class DesignOutput(BaseModel):
     asset_path: str
     workflow_type: Literal["ig_static"]
     creative_dna: CreativeDNA
+
+
+class CopyAnalysis(BaseModel):
+    """Structured output of the copy-technique classifier
+    (annotate/copy_classifier.py) — a text-only Claude pass over a video's
+    already-stored full_transcript/on_screen_text/hook_text, NOT a new
+    video-watching call. 19 boolean flags, multi-label by design (a real
+    video can trip several at once). Grounded in real reference material
+    (Winning Hook Criteria, Features/Benefits/Outcomes, VOC doc, VSL and
+    Advetorial breakdowns) — see copy_classifier.py's module docstring.
+
+    Every field is Optional[bool]: None means "the classifier genuinely
+    couldn't tell" (e.g. no speech/on-screen text at all), which is a
+    different claim than False ("present and confidently absent") — never
+    collapse the two."""
+    hook_curiosity_open_loop: Optional[bool] = Field(
+        description="Teases a result/reveal without naming the mechanism")
+    hook_pain_callout: Optional[bool] = Field(
+        description="Names the viewer's felt pain directly in the first ~3s")
+    hook_promise_without_mechanism: Optional[bool] = Field(
+        description="States the outcome/benefit, withholds the 'how'")
+    hook_specificity: Optional[bool] = Field(
+        description="Numbers/timeframes/quantities in the hook")
+    hook_credibility_signal: Optional[bool] = Field(
+        description="Authority/expert/clinical claim in the hook itself")
+    hook_pattern_interrupt: Optional[bool] = Field(
+        description="A belief-breaking/'sacred cow smash' opener")
+    hook_status_shift: Optional[bool] = Field(
+        description="'People you look up to aren't doing what you do' framing")
+
+    mentions_customer_problem: Optional[bool] = Field(
+        description="Names the problem the product solves, in any form")
+    uses_voc_language: Optional[bool] = Field(
+        description="Uses raw/colloquial customer phrasing, not clinical/marketing language")
+    agitates_pain_emotionally: Optional[bool] = Field(
+        description="Escalates consequence/shame/fear, not just states the problem")
+    burns_alternatives: Optional[bool] = Field(
+        description="Explicitly dismisses other things the viewer already tried")
+
+    explains_mechanism: Optional[bool] = Field(
+        description="Explains WHY/HOW it works, not just that it works")
+    discovery_moment_framing: Optional[bool] = Field(
+        description="Introduces the product as a casual/organic discovery, not a hard pitch")
+    uses_sensory_visual_language: Optional[bool] = Field(
+        description="Translates a benefit into a felt/visual metaphor")
+    features_framed_as_benefits: Optional[bool] = Field(
+        description="A feature is explicitly tied to why it matters to the viewer")
+
+    uses_social_proof: Optional[bool] = Field(
+        description="Testimonials, review counts, 'X customers' claims")
+    uses_authority_or_expert_proof: Optional[bool] = Field(
+        description="Credentials, institutions, 'doctor/nurse/herbalist reveals'")
+    uses_before_after_contrast: Optional[bool] = Field(
+        description="Explicit then-vs-now framing")
+
+    creates_urgency: Optional[bool] = Field(
+        description="Time pressure, scarcity, 'while it's still available'")
+    uses_risk_reversal: Optional[bool] = Field(
+        description="Guarantee, 'no questions asked', free trial")
+    cta_direct_address: Optional[bool] = Field(
+        description="Direct 'you' framing in the call to action")
+    promises_identity_or_status_shift: Optional[bool] = Field(
+        description="The ask is framed as becoming a different kind of person, not just buying")
