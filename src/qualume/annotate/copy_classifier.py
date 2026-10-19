@@ -11,7 +11,7 @@ came from. It works unchanged for:
     hook_text all present — real data exists today, see
     classify_and_store_external)
   - external paid/VSL/advertorial video (same shape, just different
-    content — the 19-flag taxonomy was deliberately kept broad enough
+    content — the 22-flag taxonomy was deliberately kept broad enough
     to cover both organic and paid framing, e.g. uses_risk_reversal and
     discovery_moment_framing are real techniques in VSLs/advertorials
     that organic clips use less often, but the classifier doesn't care
@@ -24,21 +24,34 @@ came from. It works unchanged for:
     only for now), but nothing about classify_copy() itself is
     external-specific.
 
-19 boolean flags (see models.contracts.CopyAnalysis for the full field
-list + descriptions), grounded in real reference material: Winning Hook
-Criteria (7 hook levers), Features/Benefits/Outcomes framework, the VOC
-doc's own real customer language, and the VSL/Advetorial breakdowns
-(mechanism explanation, discovery framing, risk reversal, status shift).
-Multi-label by design — a real video/static can trip several at once.
+22 copy techniques (see models.contracts.CopyAnalysisV2/TechniqueOccurrence
+for the full list + descriptions), grounded in real reference material:
+Winning Hook Criteria (7 hook levers), Features/Benefits/Outcomes
+framework, the VOC doc's own real customer language, and the VSL/
+Advetorial breakdowns (mechanism explanation, discovery framing, risk
+reversal, status shift). Multi-label by design — a real video/static can
+trip several at once, and a single technique can recur more than once.
+
+v2 (this version) asks for ONE ordered list of occurrences instead of 22
+independent True/False/null judgments (v1) — captures real sequence
+("pain callout, then mechanism, then urgency" vs. just "has pain callout
+AND mechanism AND urgency, order unknown"), which is what actually lets
+mining ask order-dependent questions later (e.g. "does problem-before-
+mechanism outperform mechanism-before-problem"). The 22 boolean columns
+on external_copy_analysis are UNCHANGED and still fully queryable — as
+of v2 they're derived from the ordered list in Python
+(derive_booleans_from_sequence), not asked of Claude independently.
+Single source of truth, same discipline as v4's hook_text derivation
+from full_transcript/shot_breakdown in gemini_watcher.py.
 """
 from typing import NamedTuple, Optional
 
 from pydantic import ValidationError
 
 from qualume.llm.pick_llm import pick_llm
-from qualume.models.contracts import CopyAnalysis
+from qualume.models.contracts import CopyAnalysisV2, copy_technique_names
 
-ANALYSIS_PROMPT_VERSION = "v1"
+ANALYSIS_PROMPT_VERSION = "v2"
 
 ANNOTATION_PROMPT = """\
 You are analyzing the COPY (spoken words, on-screen text, and caption) of a \
@@ -47,15 +60,18 @@ database. You are given text only — no video, no image, no audio. Judge \
 ONLY the copy techniques actually present in the text below; do not guess \
 at anything you cannot see in the text itself.
 
-For EACH of the 19 fields, answer true if the technique is clearly present \
-anywhere in the given text, false if it is clearly absent, or leave it \
-null if the available text genuinely doesn't give you enough to tell \
-(e.g. very little text, or the field depends on something like spoken \
-delivery you cannot observe from text alone). A real piece of copy can be \
-true on MANY fields at once — this is not a single-choice classification.
+List EVERY real occurrence of any of the 22 techniques below, IN THE ORDER \
+they actually occur in the given text (reading/listening order — hook \
+first, then body, then close, as the text itself is ordered). For each \
+occurrence, give a short VERBATIM quote from the text as evidence. A \
+technique can occur MORE THAN ONCE (e.g. urgency mentioned both early and \
+again in the closing CTA) — list it each time it genuinely recurs, don't \
+deduplicate. If none of the 22 techniques are present, return an empty \
+list. Do not invent occurrences that aren't really there just to fill the \
+list.
 
-Fields (grouped by where they typically occur, though copy doesn't have \
-to follow this structure):
+The 22 techniques (grouped by where they typically occur, though copy \
+doesn't have to follow this structure):
 
 HOOK-LEVEL (the opening few seconds/first line):
 - hook_curiosity_open_loop: teases a result/reveal without naming the mechanism
@@ -89,14 +105,33 @@ CLOSE/CTA:
 - cta_direct_address: direct "you" framing in the call to action
 - promises_identity_or_status_shift: the ask is framed as becoming a different kind of person, not just buying
 
-Return ONLY the structured fields. Do not invent text that isn't given to you.
+Return ONLY the structured technique_sequence list. Do not invent text that \
+isn't given to you.
 """
 
 
 class ClassificationResult(NamedTuple):
-    annotation: Optional[CopyAnalysis]
+    annotation: Optional[CopyAnalysisV2]
     raw_response: dict
     validation_error: Optional[str]
+
+
+def derive_booleans_from_sequence(annotation: CopyAnalysisV2) -> dict[str, bool]:
+    """Derive the 22 boolean columns from the ordered technique_sequence
+    list — True if the technique appears ANYWHERE in the sequence
+    (regardless of how many times), False if it never appears. Single
+    source of truth: Claude is asked for the sequence ONCE, these flags
+    are computed from it, never asked independently — same discipline as
+    gemini_watcher.derive_hook_fields deriving hook_text from
+    full_transcript/shot_breakdown rather than asking Gemini twice.
+
+    Note a real, deliberate v1->v2 behavior change: v1's Optional[bool]
+    distinguished None ("couldn't tell") from False ("confidently
+    absent"). A technique absent from the v2 sequence is always False
+    here — both those v1 cases collapse into one. See CopyAnalysisV2's
+    docstring for why this tradeoff was accepted."""
+    present = {occ.technique for occ in annotation.technique_sequence}
+    return {name: (name in present) for name in copy_technique_names()}
 
 
 def _build_prompt(hook_text, full_transcript, on_screen_text, caption) -> str:
@@ -139,7 +174,7 @@ def classify_copy(
         )
 
     prompt = _build_prompt(hook_text, full_transcript, on_screen_text, caption)
-    llm = pick_llm("low").with_structured_output(CopyAnalysis)
+    llm = pick_llm("low").with_structured_output(CopyAnalysisV2)
 
     try:
         annotation = llm.invoke(prompt)
@@ -204,7 +239,10 @@ def classify_and_store_external(external_content_item_id: str) -> str:
     try:
         with conn.cursor() as cur:
             if result.annotation is not None:
-                ann = result.annotation
+                flags = derive_booleans_from_sequence(result.annotation)
+                sequence_json = [
+                    occ.model_dump() for occ in result.annotation.technique_sequence
+                ]
                 cur.execute(
                     """INSERT INTO external_copy_analysis
                        (external_content_item_id,
@@ -219,25 +257,26 @@ def classify_and_store_external(external_content_item_id: str) -> str:
                         uses_before_after_contrast,
                         creates_urgency, uses_risk_reversal,
                         cta_direct_address, promises_identity_or_status_shift,
-                        raw_response, validation_error,
+                        technique_sequence, raw_response, validation_error,
                         analysis_model, analysis_prompt_version)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        RETURNING id""",
                     (
                         external_content_item_id,
-                        ann.hook_curiosity_open_loop, ann.hook_pain_callout,
-                        ann.hook_promise_without_mechanism, ann.hook_specificity,
-                        ann.hook_credibility_signal, ann.hook_pattern_interrupt, ann.hook_status_shift,
-                        ann.mentions_customer_problem, ann.uses_voc_language,
-                        ann.agitates_pain_emotionally, ann.burns_alternatives,
-                        ann.explains_mechanism, ann.discovery_moment_framing,
-                        ann.uses_sensory_visual_language, ann.features_framed_as_benefits,
-                        ann.uses_social_proof, ann.uses_authority_or_expert_proof,
-                        ann.uses_before_after_contrast,
-                        ann.creates_urgency, ann.uses_risk_reversal,
-                        ann.cta_direct_address, ann.promises_identity_or_status_shift,
-                        Json(result.raw_response), None,
+                        flags["hook_curiosity_open_loop"], flags["hook_pain_callout"],
+                        flags["hook_promise_without_mechanism"], flags["hook_specificity"],
+                        flags["hook_credibility_signal"], flags["hook_pattern_interrupt"],
+                        flags["hook_status_shift"],
+                        flags["mentions_customer_problem"], flags["uses_voc_language"],
+                        flags["agitates_pain_emotionally"], flags["burns_alternatives"],
+                        flags["explains_mechanism"], flags["discovery_moment_framing"],
+                        flags["uses_sensory_visual_language"], flags["features_framed_as_benefits"],
+                        flags["uses_social_proof"], flags["uses_authority_or_expert_proof"],
+                        flags["uses_before_after_contrast"],
+                        flags["creates_urgency"], flags["uses_risk_reversal"],
+                        flags["cta_direct_address"], flags["promises_identity_or_status_shift"],
+                        Json(sequence_json), Json(result.raw_response), None,
                         "claude", ANALYSIS_PROMPT_VERSION,
                     ),
                 )

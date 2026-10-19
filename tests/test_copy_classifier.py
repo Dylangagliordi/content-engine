@@ -11,6 +11,12 @@ external video data (built/tested here, real data exists today), owned
 content, or statics once that ingestion exists later — same
 "capture the shape before the volume" discipline as learn/replication.py
 and learn/validation.py.
+
+v2: classify_copy returns an ORDERED technique_sequence (see
+contracts.CopyAnalysisV2/TechniqueOccurrence) instead of v1's 22
+independent booleans. derive_booleans_from_sequence converts that
+ordered list back into the 22 real boolean columns for storage/mining —
+tested directly here since it's the single source of truth for both.
 """
 import json
 import uuid
@@ -24,28 +30,24 @@ from qualume.annotate.copy_classifier import (
     ANNOTATION_PROMPT,
     classify_copy,
     classify_and_store_external,
+    derive_booleans_from_sequence,
 )
-from qualume.models.contracts import CopyAnalysis
+from qualume.models.contracts import CopyAnalysisV2, TechniqueOccurrence, copy_technique_names
 from qualume.db.connection import get_connection
 from qualume.db.watchlist import add_watched_account
 
 
-def _good_flags(**overrides):
-    flags = {
-        "hook_curiosity_open_loop": True, "hook_pain_callout": False,
-        "hook_promise_without_mechanism": False, "hook_specificity": True,
-        "hook_credibility_signal": False, "hook_pattern_interrupt": False,
-        "hook_status_shift": False, "mentions_customer_problem": True,
-        "uses_voc_language": False, "agitates_pain_emotionally": False,
-        "burns_alternatives": False, "explains_mechanism": True,
-        "discovery_moment_framing": False, "uses_sensory_visual_language": False,
-        "features_framed_as_benefits": True, "uses_social_proof": False,
-        "uses_authority_or_expert_proof": False, "uses_before_after_contrast": False,
-        "creates_urgency": False, "uses_risk_reversal": False,
-        "cta_direct_address": True, "promises_identity_or_status_shift": False,
-    }
-    flags.update(overrides)
-    return flags
+def _good_sequence(*techniques):
+    """Build a CopyAnalysisV2 with the given techniques, in order, each
+    with a throwaway evidence quote."""
+    if not techniques:
+        techniques = ("hook_curiosity_open_loop", "mentions_customer_problem",
+                      "explains_mechanism", "cta_direct_address")
+    return CopyAnalysisV2(
+        technique_sequence=[
+            TechniqueOccurrence(technique=t, evidence_quote="evidence") for t in techniques
+        ]
+    )
 
 
 def test_classify_copy_calls_llm_with_all_available_text(monkeypatch):
@@ -61,7 +63,7 @@ def test_classify_copy_calls_llm_with_all_available_text(monkeypatch):
         def fake_with_structured_output(schema):
             def fake_invoke(messages):
                 captured["messages"] = messages
-                return CopyAnalysis(**_good_flags())
+                return _good_sequence()
             llm = MagicMock()
             llm.invoke = fake_invoke
             return llm
@@ -91,7 +93,7 @@ def test_classify_copy_works_with_only_on_screen_text(monkeypatch):
         mock_base = MagicMock()
         def fake_with_structured_output(schema):
             llm = MagicMock()
-            llm.invoke = lambda messages: CopyAnalysis(**_good_flags())
+            llm.invoke = lambda messages: _good_sequence()
             return llm
         mock_base.with_structured_output = fake_with_structured_output
         return mock_base
@@ -121,7 +123,7 @@ def test_classify_copy_returns_validation_error_gracefully(monkeypatch):
         def fake_with_structured_output(schema):
             llm = MagicMock()
             def fake_invoke(messages):
-                raise ValidationError.from_exception_data("CopyAnalysis", [])
+                raise ValidationError.from_exception_data("CopyAnalysisV2", [])
             llm.invoke = fake_invoke
             return llm
         mock_base.with_structured_output = fake_with_structured_output
@@ -131,6 +133,49 @@ def test_classify_copy_returns_validation_error_gracefully(monkeypatch):
     result = classify_copy(hook_text="some hook", full_transcript=None, on_screen_text=None, caption=None)
     assert result.annotation is None
     assert result.validation_error is not None
+
+
+# --- derive_booleans_from_sequence -----------------------------------
+
+
+def test_derive_booleans_marks_present_techniques_true():
+    annotation = _good_sequence("hook_pain_callout", "explains_mechanism")
+    flags = derive_booleans_from_sequence(annotation)
+    assert flags["hook_pain_callout"] is True
+    assert flags["explains_mechanism"] is True
+
+
+def test_derive_booleans_marks_absent_techniques_false_not_none():
+    """v2 behavior change from v1: absence from the sequence is always
+    False, never None - there's no 'couldn't tell' state in v2 (see
+    CopyAnalysisV2's docstring for why this was accepted)."""
+    annotation = _good_sequence("hook_pain_callout")
+    flags = derive_booleans_from_sequence(annotation)
+    assert flags["uses_social_proof"] is False
+    assert flags["creates_urgency"] is False
+
+
+def test_derive_booleans_covers_all_22_real_techniques():
+    annotation = _good_sequence()
+    flags = derive_booleans_from_sequence(annotation)
+    assert set(flags.keys()) == set(copy_technique_names())
+    assert len(flags) == 22
+
+
+def test_derive_booleans_true_for_a_technique_that_recurs_twice():
+    """A technique appearing twice in the sequence (e.g. urgency early
+    AND at the CTA) is still just True once as a boolean - the sequence
+    itself (not the boolean) is where the recurrence is visible."""
+    annotation = _good_sequence("creates_urgency", "mentions_customer_problem", "creates_urgency")
+    flags = derive_booleans_from_sequence(annotation)
+    assert flags["creates_urgency"] is True
+
+
+def test_derive_booleans_empty_sequence_is_all_false():
+    annotation = _good_sequence()
+    annotation.technique_sequence = []
+    flags = derive_booleans_from_sequence(annotation)
+    assert all(v is False for v in flags.values())
 
 
 # --- classify_and_store_external (DB-backed, real external video data) -----
@@ -208,8 +253,9 @@ def test_classify_and_store_external_pulls_real_row_and_stores_result(fake_accou
 
     def fake_classify_copy(**kwargs):
         from qualume.annotate.copy_classifier import ClassificationResult
+        ann = _good_sequence("hook_curiosity_open_loop", "cta_direct_address")
         return ClassificationResult(
-            annotation=CopyAnalysis(**_good_flags()), raw_response=_good_flags(), validation_error=None,
+            annotation=ann, raw_response=ann.model_dump(), validation_error=None,
         )
     monkeypatch.setattr("qualume.annotate.copy_classifier.classify_copy", fake_classify_copy)
 
@@ -219,7 +265,8 @@ def test_classify_and_store_external_pulls_real_row_and_stores_result(fake_accou
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT hook_curiosity_open_loop, cta_direct_address, analysis_prompt_version "
+                "SELECT hook_curiosity_open_loop, cta_direct_address, analysis_prompt_version, "
+                "technique_sequence "
                 "FROM external_copy_analysis WHERE id = %s",
                 (analysis_id,),
             )
@@ -229,6 +276,7 @@ def test_classify_and_store_external_pulls_real_row_and_stores_result(fake_accou
     assert row[0] is True
     assert row[1] is True
     assert row[2] == ANALYSIS_PROMPT_VERSION
+    assert len(row[3]) == 2  # the real ordered sequence was stored, not just derived booleans
 
 
 def test_classify_and_store_external_raises_for_unknown_item():

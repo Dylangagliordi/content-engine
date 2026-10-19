@@ -1,0 +1,24 @@
+-- technique_sequence: the ORDERED list of copy-technique occurrences for
+-- a video/static, replacing "does X appear anywhere" with "what order do
+-- things actually happen in". Added for analysis_prompt_version='v2'.
+--
+-- Deliberately a plain ordered JSONB array, NOT numeric timestamps/
+-- percentages - same lesson as the Gemini granularity-ceiling mistake
+-- (removed 2026-10-16): asking an LLM for a precise position value it
+-- can't reliably produce creates false precision. Asking it to list
+-- techniques "in the order they occur" is a much more reliable task -
+-- list order IS the position, no numbers to get wrong.
+--
+-- Shape: [{"technique": "hook_pain_callout", "evidence_quote": "..."}, ...]
+-- `technique` values are the same 19 taxonomy names as the boolean
+-- columns below - this is the SAME taxonomy, just now capturing order
+-- and evidence instead of independent yes/no judgments.
+--
+-- The 19 boolean columns are UNCHANGED (still real columns, still
+-- queryable/mineable exactly as before) but as of v2 they are DERIVED
+-- from technique_sequence in Python (see
+-- annotate/copy_classifier.derive_booleans_from_sequence), not asked of
+-- Claude independently - single source of truth, same discipline as v4's
+-- hook_text derivation from full_transcript/shot_breakdown.
+ALTER TABLE external_copy_analysis
+    ADD COLUMN technique_sequence JSONB;

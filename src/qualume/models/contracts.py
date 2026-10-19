@@ -272,12 +272,70 @@ class DesignOutput(BaseModel):
     creative_dna: CreativeDNA
 
 
+class TechniqueOccurrence(BaseModel):
+    """One real occurrence of a copy technique, positioned by LIST ORDER
+    (not a timestamp/percentage) — see copy_classifier.py v2 module
+    docstring for why: asking an LLM for a precise numeric position it
+    can't reliably produce creates false precision (same lesson as the
+    Gemini granularity-ceiling mistake). Listing occurrences in the order
+    they actually appear is a far more reliable task."""
+    technique: Literal[
+        "hook_curiosity_open_loop", "hook_pain_callout", "hook_promise_without_mechanism",
+        "hook_specificity", "hook_credibility_signal", "hook_pattern_interrupt", "hook_status_shift",
+        "mentions_customer_problem", "uses_voc_language", "agitates_pain_emotionally",
+        "burns_alternatives", "explains_mechanism", "discovery_moment_framing",
+        "uses_sensory_visual_language", "features_framed_as_benefits", "uses_social_proof",
+        "uses_authority_or_expert_proof", "uses_before_after_contrast", "creates_urgency",
+        "uses_risk_reversal", "cta_direct_address", "promises_identity_or_status_shift",
+    ] = Field(
+        description="Which of the 22 copy techniques this occurrence is")
+    evidence_quote: str = Field(
+        description="A short, verbatim quote from the given text that shows this technique")
+
+
+class CopyAnalysisV2(BaseModel):
+    """v2 copy-technique classifier output — replaces 22 independent
+    True/False/null judgments (v1 CopyAnalysis) with ONE ordered list of
+    real occurrences, each carrying its own evidence quote. The 22
+    boolean columns on external_copy_analysis still exist and are still
+    fully queryable — as of v2 they are DERIVED from this list in Python
+    (see copy_classifier.derive_booleans_from_sequence), not asked of
+    Claude independently. Single source of truth, same discipline as
+    v4's hook_text derivation from full_transcript/shot_breakdown.
+
+    A technique can appear MORE THAN ONCE in the list if it genuinely
+    recurs (e.g. urgency mentioned both early and in the CTA) — list
+    order is real occurrence order, not a deduped set.
+
+    Known tradeoff vs. v1: v1's Optional[bool] distinguished None
+    ("couldn't tell") from False ("confidently absent"). A technique
+    simply absent from this list collapses both those cases — accepted
+    deliberately, since asking for an explicit null per list entry is
+    awkward; "not observed" is the practical meaning either way."""
+    technique_sequence: list[TechniqueOccurrence] = Field(
+        description="Every technique occurrence found, IN THE ORDER it occurs in the given "
+                     "text. Empty list if none of the 22 techniques are present.")
+
+
+def copy_technique_names() -> tuple[str, ...]:
+    """The 22 real taxonomy names, read directly off TechniqueOccurrence's
+    Literal type annotation — single source of truth, so this can never
+    drift out of sync with what the classifier is actually allowed to
+    return (no second hardcoded list to keep in step)."""
+    import typing
+    field = TechniqueOccurrence.model_fields["technique"]
+    return typing.get_args(field.annotation)
+
+
 class CopyAnalysis(BaseModel):
-    """Structured output of the copy-technique classifier
-    (annotate/copy_classifier.py) — a text-only Claude pass over a video's
-    already-stored full_transcript/on_screen_text/hook_text, NOT a new
-    video-watching call. 19 boolean flags, multi-label by design (a real
-    video can trip several at once). Grounded in real reference material
+    """v1 copy-technique classifier output — SUPERSEDED by CopyAnalysisV2
+    (kept, unchanged, for versioning traceability of existing v1 rows;
+    same discipline as ShotBreakdownV3 being kept alongside
+    ShotBreakdownV4/V5). Do not use for new classification — see
+    copy_classifier.py for the live v2 pipeline.
+
+    22 boolean flags, multi-label by design (a real video can trip
+    several at once). Grounded in real reference material
     (Winning Hook Criteria, Features/Benefits/Outcomes, VOC doc, VSL and
     Advetorial breakdowns) — see copy_classifier.py's module docstring.
 
@@ -285,6 +343,7 @@ class CopyAnalysis(BaseModel):
     couldn't tell" (e.g. no speech/on-screen text at all), which is a
     different claim than False ("present and confidently absent") — never
     collapse the two."""
+
     hook_curiosity_open_loop: Optional[bool] = Field(
         description="Teases a result/reveal without naming the mechanism")
     hook_pain_callout: Optional[bool] = Field(
