@@ -39,12 +39,14 @@ from psycopg2.extras import Json
 
 from qualume.models.contracts import (
     ExternalVideoAnnotationV5,
+    ExternalVideoAnnotationV6,
+    PresenterDescription,
     ScriptBeat,
     ShotBreakdownV4,
     TranscriptSegment,
 )
 
-ANALYSIS_PROMPT_VERSION = "v5"
+ANALYSIS_PROMPT_VERSION = "v6"
 
 # gemini-3.8-flash is the newest/most capable and real on this key, but is
 # returning persistent 503 ServerError specifically on video input as of
@@ -181,6 +183,33 @@ one entry — the point is not merging separate sentences together, not \
 hitting a time limit. A typical 30-second talking video has roughly 6-12 \
 entries. This is the COMPLETE transcript, not just the hook — include everything said, \
 through to the end of the video. Empty list if there is no speech.
+
+Presenter/avatar and topic fields.
+- presenters: every DISTINCT real person visibly on camera at any point, in \
+order of first appearance. Empty list if nobody is ever visibly shown (e.g. \
+pure product shots, voiceover-over-broll with no face on screen). For each \
+presenter, describe ONLY what is visibly observable:
+  - apparent_age_range: the apparent age bucket from how they visibly present \
+(child, teen, 20s, 30s, 40s, 50s, 60_plus, or unclear) — an observation about \
+presentation, not a claim about their real age.
+  - apparent_gender_presentation: male, female, or androgynous_or_unclear — \
+an observation about presentation, not a claim about real gender identity.
+  - relatable_archetype: the relatable role/persona they read as to a viewer \
+(snake_case, e.g. mom, nurse, young_professional, grandma, fitness_coach, \
+regular_person).
+  - wardrobe_style: what they are visibly wearing/styled as (e.g. "casual \
+loungewear", "medical scrubs", "business casual", "athleisure").
+  - delivery_affect: their visible delivery style as a GERUND PHRASE that \
+reads naturally in "a mom in her kitchen, ___ about X" — e.g. "passionately \
+talking", "calmly confiding", "excitedly sharing", "tearfully explaining", \
+"casually chatting".
+- delivery_mode: how the content is delivered overall — direct_to_camera, \
+voiceover_only, pov, interview_style, or no_presenter if nobody is ever on \
+screen.
+- video_topic_summary: one plain sentence summarizing what this video is \
+actually ABOUT — the real subject matter being discussed/shown (e.g. "night \
+sweats and hot flashes during menopause", "a morning skincare routine", \
+"picky eating in toddlers").
 """
 
 
@@ -196,6 +225,78 @@ def _hook_window(timeline: list[ScriptBeat]) -> tuple[float, float]:
         if beat.beat.strip().lower() == "hook":
             return beat.start_sec, beat.end_sec
     return HOOK_FALLBACK_WINDOW_SEC
+
+
+def _article_phrase(presenter) -> str:
+    """'a mom' / 'an elderly nurse' etc - article + archetype, snake_case
+    archetype turned into natural words."""
+    archetype = presenter.relatable_archetype.replace("_", " ").strip()
+    article = "an" if archetype[:1].lower() in "aeiou" else "a"
+    return f"{article} {archetype}"
+
+
+def derive_scene_description(
+    presenters: list,
+    setting: str | None,
+    video_topic_summary: str | None,
+) -> str:
+    """Build the one-sentence scene description the user specifically
+    asked for: "this vid was a mom in her kitchen passionately talking
+    about night sweats". Deterministic composition from structured
+    fields — single source of truth, same discipline as
+    derive_hook_fields (never ask Gemini for this sentence directly,
+    always compose it from the typed presenter/setting/topic fields so
+    it can't silently drift from them).
+
+    presenters: list[PresenterDescription], already-parsed (from a valid
+    ExternalVideoAnnotationV6) or already-dict-shaped (degraded path) —
+    accepts either, same best-effort-on-the-degraded-path discipline as
+    the rest of gemini_watcher.
+    - Empty list -> "Product/visual-only footage in <setting>, about
+      <topic>." (no person ever visibly shown — e.g. pure product shots).
+    - One presenter -> "A <archetype> in <setting>, <delivery_affect>
+      about <topic>."
+    - Multiple presenters -> each archetype joined with "and", one
+      shared delivery_affect/setting/topic (real multi-presenter nuance,
+      e.g. two different delivery affects for two people, is a possible
+      future refinement — not built here, kept simple and honest about
+      what's actually composed).
+
+    setting=None (shot_breakdown unavailable, e.g. degraded path) or
+    video_topic_summary=None (annotation validation failed) degrade
+    gracefully — omit that clause rather than crash or fabricate a
+    placeholder value."""
+    def _as_presenter(p):
+        from qualume.models.contracts import PresenterDescription
+        return p if isinstance(p, PresenterDescription) else PresenterDescription(**p)
+
+    people = [_as_presenter(p) for p in presenters]
+
+    if not people:
+        subject = "Product/visual-only footage"
+        affect_clause = ""
+    else:
+        archetypes = " and ".join(_article_phrase(p) for p in people)
+        subject = archetypes[0].upper() + archetypes[1:]
+        affect_clause = people[0].delivery_affect.strip()
+
+    sentence = subject
+    if setting:
+        setting_clean = setting.strip()
+        article = "an" if setting_clean[:1].lower() in "aeiou" else "a"
+        sentence += f" in {article} {setting_clean}"
+
+    if affect_clause:
+        sentence += f", {affect_clause}"
+        if video_topic_summary:
+            sentence += f" about {video_topic_summary.strip()}"
+    elif video_topic_summary:
+        sentence += f", about {video_topic_summary.strip()}"
+
+    sentence = sentence.strip()
+    if not sentence.endswith("."):
+        sentence += "."
+    return sentence
 
 
 def _shot_phrase(shot: ShotBreakdownV4) -> str:
@@ -248,7 +349,7 @@ def derive_hook_fields(
 
 
 def _check_coverage(
-    annotation: ExternalVideoAnnotationV5, video_duration_seconds: float | None
+    annotation: ExternalVideoAnnotationV6, video_duration_seconds: float | None
 ) -> list[str]:
     """Return human-readable warnings for a schema-valid annotation that
     doesn't actually cover the real video (empty list = looks complete).
@@ -308,7 +409,7 @@ def _parse_raw_list(model: type[_M], items) -> list[_M] | None:
 
 
 class AnnotationResult(NamedTuple):
-    annotation: ExternalVideoAnnotationV5 | None  # None if schema validation failed
+    annotation: ExternalVideoAnnotationV6 | None  # None if schema validation failed
     raw_response: dict  # complete parsed Gemini response, including unmapped keys —
                          # ALWAYS populated when Gemini returned anything parseable,
                          # even if `annotation` is None. Nothing gets silently dropped.
@@ -361,7 +462,7 @@ def annotate_video(local_video_path: str, video_duration_seconds: float | None) 
             contents=[video, ANNOTATION_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotationV5,
+                response_schema=ExternalVideoAnnotationV6,
                 temperature=GEMINI_TEMPERATURE,
             ),
         )
@@ -375,7 +476,7 @@ def annotate_video(local_video_path: str, video_duration_seconds: float | None) 
                 f"Gemini response for {local_video_path} is not a JSON object: {response.text[:200]}"
             )
         try:
-            annotation = ExternalVideoAnnotationV5.model_validate(raw_response)
+            annotation = ExternalVideoAnnotationV6.model_validate(raw_response)
         except ValidationError as e:
             # Don't lose the raw response just because our strict schema (e.g.
             # chronological-order checks) rejected it — row 5 above. Capture
@@ -454,6 +555,14 @@ def annotate_and_store(external_content_item_id: str) -> str:
                 pacing_qualitative=ann.pacing_qualitative, music_mood_v2=ann.music_mood,
                 shot_breakdown=Json([s.model_dump() for s in ann.shot_breakdown]),
                 full_transcript=Json([t.model_dump() for t in ann.full_transcript]),
+                presenters=Json([p.model_dump() for p in ann.presenters]),
+                delivery_mode=ann.delivery_mode,
+                video_topic_summary=ann.video_topic_summary,
+                scene_description=derive_scene_description(
+                    ann.presenters,
+                    ann.shot_breakdown[0].setting if ann.shot_breakdown else None,
+                    ann.video_topic_summary,
+                ),
             )
         else:
             # Validation failed — pull what we safely can straight from the raw
@@ -475,6 +584,18 @@ def annotate_and_store(external_content_item_id: str) -> str:
             if shots is not None:
                 visual_hook_description = derive_hook_fields(timeline, [], shots)[1]
 
+            # Best-effort presenters/scene_description on the degraded path —
+            # same discipline as hook fields above: only compute from data
+            # that actually parsed, leave NULL rather than guess.
+            presenters_parsed = _parse_raw_list(PresenterDescription, _raw("presenters"))
+            raw_topic = _raw("video_topic_summary")
+            scene_description = None
+            if presenters_parsed is not None and raw_topic:
+                first_shot_setting = shots[0].setting if shots else None
+                scene_description = derive_scene_description(
+                    presenters_parsed, first_shot_setting, raw_topic
+                )
+
             values = dict(
                 hook_type=_raw("hook_type"), hook_text=hook_text,
                 visual_hook_description=visual_hook_description,
@@ -487,6 +608,10 @@ def annotate_and_store(external_content_item_id: str) -> str:
                 script_structure_timeline=None, on_screen_text=None, emotion_timeline=None,
                 pacing_qualitative=_raw("pacing_qualitative"), music_mood_v2=_raw("music_mood"),
                 shot_breakdown=None, full_transcript=None,
+                presenters=Json(_raw("presenters")) if presenters_parsed is not None else None,
+                delivery_mode=_raw("delivery_mode"),
+                video_topic_summary=raw_topic,
+                scene_description=scene_description,
             )
 
         with conn.cursor() as cur:
@@ -497,10 +622,11 @@ def annotate_and_store(external_content_item_id: str) -> str:
                         social_proof_used, energy_level, tone_category, voice_delivery_style,
                         script_structure_timeline, on_screen_text, emotion_timeline,
                         pacing_qualitative, music_mood_v2, shot_breakdown, full_transcript,
+                        presenters, delivery_mode, video_topic_summary, scene_description,
                         raw_gemini_response, validation_error, coverage_warning,
                         analysis_model, analysis_prompt_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (
                     external_content_item_id, values["hook_type"], values["hook_text"],
@@ -511,6 +637,8 @@ def annotate_and_store(external_content_item_id: str) -> str:
                     values["on_screen_text"], values["emotion_timeline"],
                     values["pacing_qualitative"], values["music_mood_v2"],
                     values["shot_breakdown"], values["full_transcript"],
+                    values["presenters"], values["delivery_mode"],
+                    values["video_topic_summary"], values["scene_description"],
                     Json(raw_response), validation_error, coverage_warning,
                     GEMINI_MODEL, ANALYSIS_PROMPT_VERSION,
                 ),

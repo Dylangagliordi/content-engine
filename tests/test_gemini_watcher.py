@@ -12,6 +12,7 @@ from qualume.models.contracts import (
     ExternalVideoAnnotationV3,
     ExternalVideoAnnotationV4,
     ExternalVideoAnnotationV5,
+    ExternalVideoAnnotationV6,
     ScriptBeat,
     ShotBreakdown,
     ShotBreakdownV4,
@@ -147,6 +148,24 @@ def _good_v5_dict(**overrides):
             {"start_sec": 7.5, "text": "You just twist and press."},
             {"start_sec": 12.0, "text": "Follow for part two."},
         ],
+    )
+    data.update(overrides)
+    return data
+
+
+def _good_v6_dict(**overrides):
+    data = _good_v5_dict(
+        presenters=[
+            {
+                "apparent_age_range": "30s",
+                "apparent_gender_presentation": "female",
+                "relatable_archetype": "mom",
+                "wardrobe_style": "casual loungewear",
+                "delivery_affect": "passionately talking",
+            }
+        ],
+        delivery_mode="direct_to_camera",
+        video_topic_summary="an herbal immune supplement for kids",
     )
     data.update(overrides)
     return data
@@ -390,6 +409,80 @@ def test_prompt_describes_v4_shot_fields_and_their_vocabularies():
         assert word in ANNOTATION_PROMPT, f"ANNOTATION_PROMPT never mentions {word}"
 
 
+# --- Contract v6 (presenter/avatar + topic) ------------------------------
+
+
+def test_prompt_describes_v6_presenter_and_topic_fields():
+    for word in ["presenters", "apparent_age_range", "apparent_gender_presentation",
+                 "relatable_archetype", "wardrobe_style", "delivery_affect",
+                 "delivery_mode", "video_topic_summary", "observable", "not a claim"]:
+        assert word in ANNOTATION_PROMPT, f"ANNOTATION_PROMPT never mentions {word!r}"
+
+
+def test_v6_contract_accepts_good_presenter_data():
+    ann = ExternalVideoAnnotationV6(**_good_v6_dict())
+    assert len(ann.presenters) == 1
+    assert ann.presenters[0].apparent_age_range == "30s"
+    assert ann.presenters[0].relatable_archetype == "mom"
+    assert ann.delivery_mode == "direct_to_camera"
+    assert ann.video_topic_summary == "an herbal immune supplement for kids"
+
+
+def test_v6_contract_accepts_empty_presenters_list():
+    """Product-only shots/voiceover-over-broll with nobody on screen is a
+    real, valid shape - not an error."""
+    raw = _good_v6_dict(presenters=[], delivery_mode="no_presenter")
+    ann = ExternalVideoAnnotationV6(**raw)
+    assert ann.presenters == []
+
+
+def test_v6_contract_rejects_invalid_age_range():
+    raw = _good_v6_dict()
+    raw["presenters"][0]["apparent_age_range"] = "100s"  # not a real bucket
+    with pytest.raises(ValidationError):
+        ExternalVideoAnnotationV6(**raw)
+
+
+def test_annotate_and_store_persists_presenters_and_scene_description():
+    """End-to-end: the presenter/topic fields Gemini returns actually land
+    in the real DB columns (presenters, delivery_mode, video_topic_summary,
+    scene_description) - not just validated and discarded."""
+    handle = f"test_v6_store_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(handle)
+    try:
+        account_id = add_watched_account("tiktok", handle)
+        item_id = _insert_item(account_id, "/fake/path/v6test.mp4", duration_seconds=17)
+        raw = _good_v6_dict()
+        result = gemini_watcher.AnnotationResult(
+            annotation=ExternalVideoAnnotationV6(**raw), raw_response=raw)
+
+        with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result):
+            dna_id = annotate_and_store(item_id)
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT presenters, delivery_mode, video_topic_summary, scene_description
+                       FROM external_creative_dna WHERE id = %s""",
+                    (dna_id,),
+                )
+                presenters, delivery_mode, topic, scene = cur.fetchone()
+        finally:
+            conn.close()
+
+        assert len(presenters) == 1
+        assert presenters[0]["relatable_archetype"] == "mom"
+        assert delivery_mode == "direct_to_camera"
+        assert topic == "an herbal immune supplement for kids"
+        assert scene is not None
+        assert "mom" in scene
+        assert "passionately talking" in scene
+        assert "an herbal immune supplement for kids" in scene
+    finally:
+        _cleanup_account(handle)
+
+
 # --- Contract v5 -------------------------------------------------------------
 
 
@@ -406,7 +499,7 @@ def _real_bug_32s_dict():
     accepts this shape too now, same as v4 — the fix for THIS specific
     failure mode is the prompt wording asking Gemini not to merge
     sentences/cuts, not a contract-level validator."""
-    return _good_v5_dict(
+    return _good_v6_dict(
         script_structure_timeline=[
             {"beat": "hook", "start_sec": 0.0, "end_sec": 3.0},
             {"beat": "demo", "start_sec": 3.0, "end_sec": 26.0},
@@ -691,7 +784,7 @@ def test_annotate_video_raises_clear_error_when_api_key_missing(monkeypatch, fak
 
 
 def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_key, fake_video):
-    client = _mock_client(json.dumps(_good_v5_dict()))
+    client = _mock_client(json.dumps(_good_v6_dict()))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client) as client_cls, \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         result = annotate_video(fake_video, V5_VIDEO_DURATION)
@@ -707,12 +800,12 @@ def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_ke
     assert isinstance(contents[1], str) and contents[1].strip()
     config = call.kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema is ExternalVideoAnnotationV5
+    assert config.response_schema is ExternalVideoAnnotationV6
     assert config.temperature == GEMINI_TEMPERATURE == None  # noqa: E711 — real sentinel, not falsy 0
 
-    assert isinstance(result.annotation, ExternalVideoAnnotationV5)
-    assert result.annotation == ExternalVideoAnnotationV5(**_good_v5_dict())
-    assert result.raw_response == _good_v5_dict()
+    assert isinstance(result.annotation, ExternalVideoAnnotationV6)
+    assert result.annotation == ExternalVideoAnnotationV6(**_good_v6_dict())
+    assert result.raw_response == _good_v6_dict()
     assert result.coverage_warning is None
     client.files.delete.assert_called_once_with(name="files/abc123")
 
@@ -720,7 +813,7 @@ def test_annotate_video_uploads_waits_for_active_and_constrains_output(gemini_ke
 def test_annotate_video_reports_incomplete_coverage_without_failing(gemini_key, fake_video):
     """Shots that stop at 10s of a 32s video: schema-valid, so annotation is
     kept, but the coverage gap is surfaced rather than silently accepted."""
-    raw = _good_v5_dict(
+    raw = _good_v6_dict(
         script_structure_timeline=[{"beat": "hook", "start_sec": 0.0, "end_sec": 10.0}],
         shot_breakdown=[_shot(0.0, 5.0), _shot(5.0, 10.0)],
         full_transcript=[{"start_sec": 0.0, "text": "a"}, {"start_sec": 4.0, "text": "b"}],
@@ -729,7 +822,7 @@ def test_annotate_video_reports_incomplete_coverage_without_failing(gemini_key, 
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
         result = annotate_video(fake_video, 32)
-    assert isinstance(result.annotation, ExternalVideoAnnotationV5)
+    assert isinstance(result.annotation, ExternalVideoAnnotationV6)
     assert result.validation_error is None
     assert "shot_breakdown" in result.coverage_warning
 
@@ -756,7 +849,7 @@ def test_annotate_video_accepts_the_formerly_rejected_collapsed_transcript_shape
 def test_annotate_video_keeps_full_raw_response_including_unmapped_keys(gemini_key, fake_video):
     """Nothing Gemini returns is discarded: keys with no typed field still
     land in raw_response."""
-    raw = _good_v5_dict(unmapped_extra={"anything": [1, 2, 3]})
+    raw = _good_v6_dict(unmapped_extra={"anything": [1, 2, 3]})
     client = _mock_client(json.dumps(raw))
     with patch("qualume.annotate.gemini_watcher.genai.Client", return_value=client), \
          patch("qualume.annotate.gemini_watcher.time.sleep"):
@@ -883,11 +976,11 @@ def test_annotate_and_store_inserts_row_with_provenance():
         item_id = _insert_item(account_id, "/fake/path/7123.mp4", duration_seconds=17)
         # Gemini's own hook answers deliberately disagree with its transcript/
         # shots — the stored values must be the derived ones, not these.
-        raw = _good_v5_dict(social_proof_used=True, unmapped_extra="kept",
+        raw = _good_v6_dict(social_proof_used=True, unmapped_extra="kept",
                             hook_text="Gemini's independently drifted hook",
                             visual_hook_description="Gemini's independent visual read")
         result = gemini_watcher.AnnotationResult(
-            annotation=ExternalVideoAnnotationV5(**raw), raw_response=raw,
+            annotation=ExternalVideoAnnotationV6(**raw), raw_response=raw,
             coverage_warning="shot_breakdown stops at 17.0s of a 99s video")
 
         with patch("qualume.annotate.gemini_watcher.annotate_video", return_value=result) as mock_annotate:
@@ -936,7 +1029,7 @@ def test_annotate_and_store_inserts_row_with_provenance():
         assert music is None   # legacy column stays NULL; real data is music_mood_v2
         assert extended == {}
         assert model == GEMINI_MODEL
-        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v5"
+        assert prompt_version == ANALYSIS_PROMPT_VERSION == "v6"
         assert analyzed_at is not None
         assert timeline == raw["script_structure_timeline"]
         assert on_screen == raw["on_screen_text"]

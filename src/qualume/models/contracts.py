@@ -237,6 +237,86 @@ class ExternalVideoAnnotationV5(ExternalVideoAnnotationV4):
     pass
 
 
+ApparentAgeRange = Literal["child", "teen", "20s", "30s", "40s", "50s", "60_plus", "unclear"]
+ApparentGenderPresentation = Literal["male", "female", "androgynous_or_unclear"]
+DeliveryMode = Literal[
+    "direct_to_camera", "voiceover_only", "pov", "interview_style", "no_presenter",
+]
+
+
+class PresenterDescription(BaseModel):
+    """ONE real person visibly on camera, described by OBSERVABLE
+    PRESENTATION ONLY — apparent age bucket and apparent gender
+    presentation from what's visibly shown, never identity inference.
+    Same purpose as "avatar testing" in real paid-media buying (testing
+    which presenter casting performs best for an offer) — the point is
+    deciding who to CAST in future content, not profiling the real
+    person in someone else's video.
+
+    relatable_archetype and delivery_affect are deliberately free
+    strings, not closed vocabularies — same "learned label, not fixed
+    upfront" discipline as hook_type/format_tag (see
+    creative_dna_feature_registry). This is exactly what lets the data
+    say "mom", "nurse", "young professional", "grandma", etc. as real
+    categories emerge from real videos, instead of the taxonomy
+    guessing them in advance."""
+    apparent_age_range: ApparentAgeRange = Field(
+        description="Observable apparent age bucket from how the person visibly presents, "
+                     "not a claim about their real age")
+    apparent_gender_presentation: ApparentGenderPresentation = Field(
+        description="Observable apparent gender presentation from how the person visibly "
+                     "presents, not a claim about their real gender identity")
+    relatable_archetype: str = Field(
+        description="The relatable role/persona this presenter reads as to a viewer, free "
+                     "text, snake_case, e.g. mom, nurse, young_professional, grandma, "
+                     "fitness_coach, regular_person")
+    wardrobe_style: str = Field(
+        description="What the presenter is visibly wearing/styled as, free text, e.g. "
+                     "'casual loungewear', 'medical scrubs', 'business casual', 'athleisure'")
+    delivery_affect: str = Field(
+        description="The presenter's visible delivery style as a GERUND PHRASE that reads "
+                     "naturally in 'a mom in her kitchen, ___ about night sweats' — e.g. "
+                     "'passionately talking', 'calmly confiding', 'excitedly sharing', "
+                     "'tearfully explaining', 'casually chatting'")
+
+
+class ExternalVideoAnnotationV6(ExternalVideoAnnotationV5):
+    """v6 adds the presenter/avatar description and a one-sentence topic
+    summary the user specifically asked for — the project could already
+    say WHAT a video's copy does (v2 copy classifier) and WHERE/HOW it's
+    shot (shot_breakdown's setting/lighting/camera), but had a real,
+    total blind spot on WHO is on screen and WHAT it's actually about in
+    plain language. Neither existed anywhere before v6 — zero presenter/
+    avatar fields on any prior version, confirmed by schema inspection
+    before building this.
+
+    presenters is a list (not a single field) because a video can have
+    zero (product-only/voiceover-over-broll with no visible person),
+    one, or multiple distinct presenters (e.g. two people in
+    conversation) — each gets independently described, not forced into
+    one combined field.
+
+    video_topic_summary is new: hook_text/full_transcript capture the
+    exact words, but nothing before this summarized WHAT a video is
+    actually about in one plain sentence (e.g. "night sweats and hot
+    flashes during menopause") — needed as the direct object in the
+    "mom in her kitchen passionately talking about X" sentence this
+    field set was built to support (see
+    gemini_watcher.derive_scene_description)."""
+    presenters: list[PresenterDescription] = Field(
+        description="Every distinct person visibly on camera, in order of first appearance; "
+                     "empty list if no person is ever visibly shown (e.g. pure product shots, "
+                     "voiceover-over-broll with no face on screen)")
+    delivery_mode: DeliveryMode = Field(
+        description="How the content is delivered overall: direct_to_camera, voiceover_only, "
+                     "pov, interview_style, or no_presenter if nobody is ever on screen")
+    video_topic_summary: str = Field(
+        description="One plain sentence summarizing what this video is actually ABOUT — the "
+                     "real subject matter being discussed/shown, e.g. 'night sweats and hot "
+                     "flashes during menopause', 'a morning skincare routine', 'picky eating "
+                     "in toddlers'")
+
+
 class CampaignBrief(BaseModel):
     """Input contract to the WRITE engine."""
     product_or_topic: str
