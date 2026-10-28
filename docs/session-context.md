@@ -1,85 +1,51 @@
-# Qualume — Session Handoff (2026-10-12)
+# Qualume — Session Handoff (2026-10-28)
 
 ## Start here next session
 Read this file first, not chat history. Detail docs referenced below have the full writeups.
 
 ## Project state (all verified, not assumed)
-- 51/51 tests passing. Git clean. Playbook at v2 (anti-fabrication claims rule + vyralcontent
-  hook hypotheses). Retry loop on by default (max_attempts=2, measured 73%->100% pass-rate lift
-  post-claims-fix). Zero TikTok accounts watched yet — reading engine built/tested but idle.
-  5 unpublished draft IG statics in data/assets/, nothing has ever actually been published.
-- Hermes itself now runs on Claude Pro subscription auth (CLAUDE_CODE_OAUTH_TOKEN), not API
-  credits — switched 2026-10-10 after diagnosing real spend. Qualume's own `.env` key is separate
-  and unaffected. Three distinct cost meters, still true: this Hermes session, Qualume's own API
-  key, Claude Code's Pro-plan session usage (separate daily cap).
+- 238/238 tests passing. Git clean.
+- Watchlist: 2 TikTok accounts active (@pinkstork, @wishgardenherbs, both `watchlist_type=competitor`).
+- 60 external_content_items ingested. ALL 60 now annotated at v6 (presenter/avatar + scene
+  description) — backfill completed 2026-10-28, verified against real DB rows (not mocked).
+  Two of the 60 initially had no downloaded video file (`local_video_path` NULL); ran
+  `tiktok_reader.download_pending_videos()` to pull them, then annotated — both succeeded.
+- Gemini's earlier persistent 503 ("high demand") outage on `gemini-3.1-flash-lite` has cleared.
+  Confirmed via live calls, not assumption — note if it recurs, it's a known transient external
+  issue, not a code bug (same pattern seen before).
+- Copy-technique classifier v2 (ordered 22-flag technique sequence) built and live-verified
+  2026-10-17/19, improved accuracy over v1 on the same real video.
+- n8n (`qualume-n8n` container, OrbStack, localhost:5678, healthz OK) wired to a real local HTTP
+  server wrapping the ingestion pipeline (`host.docker.internal`). Workflow (Schedule -> HTTP ->
+  /run-ingestion-cycle -> poll -> download -> Gemini -> Claude -> mine) is IMPORTED into n8n's UI
+  but NOT YET ACTIVATED — still a manual step for the user.
+- Hermes runs on Claude Pro subscription auth (CLAUDE_CODE_OAUTH_TOKEN), not API credits. Qualume's
+  own `.env` ANTHROPIC_API_KEY is separate and unaffected. Three distinct cost meters.
 
-## Current focus: designing Part 5 (Learn engine) before building it
-Full design: `plans/learn-engine-idea-sourcing-architecture.md` (revised twice same-week, see its
-own Revision log). Core shape as of 2026-10-12:
-- `external_creative_dna` (external content's structured-DNA table, mirrors owned `creative_dna`
-  + vibe fields) — NOT YET migrated into the DB.
-- `creative_dna_feature_registry` + `extended_features` JSONB — features are learned/promoted
-  over time via a "feature discovery" sub-step, not hardcoded forever.
-- Gemini DECIDED as the video-watching model (native audio+video fusion) — deliberate scoped
-  exception to Claude-only, every other stage stays Claude. CLAUDE.md still needs a line updated
-  to reflect this explicitly (attempted once, write requires explicit user approval on that
-  protected file, prompt timed out — ask user directly next time, don't force-retry).
-- No static "data overview" doc — retrieval against the existing `insights` table instead
-  (`applies_to_segment` JSONB addition), ranked by effect_size/sample_size/recency per-brief.
-  pgvector NOT installed (checked) — tag-based filtering first, semantic search is a real future
-  upgrade, not built ahead of need.
-- `content_items.grounding_refs` — closes the loop: a published post's real performance
-  re-validates (or weakens) the specific insight(s) that inspired it.
-- **Not yet added to the doc, discussed 2026-10-12, needs folding in next session**:
-  - Own-content performance should be judged against OUR OWN account's rolling median/stddev
-    baseline (not raw numbers) before counting as evidence for/against an insight — this was
-    MY design reasoning in conversation, NOT sourced from any GitHub repo (corrected a
-    mischaracterization where it was implied to be research-backed). Compute fresh at
-    query/mining time, don't persist as a column (append-only principle).
-  - Split `insights` into `insights_external` (mined from watched accounts, capped lower trust
-    even at tier=accepted) and `insights_owned` (tested against our own account, the one that
-    actually drives decisions) — mirrors the existing owned-vs-external table separation
-    principle already applied elsewhere in this schema. Third, lower-priority future table:
-    `insights_meta` (patterns about patterns, e.g. "hook insights have higher effect size than
-    CTA insights on average") — not urgent, no data to support it yet.
-  - The existing `experiments` table (batch_id, hypothesis, explore_exploit_ratio,
-    workflow_type, outcome_summary) is the actual mechanism for deliberately testing an insight
-    against our account — already built, under-referenced in the design doc so far, tie it in
-    explicitly rather than inventing a new mechanism.
-  - User's "planner vs do-er" question connects directly to the SQL Analyst LangGraph pattern
-    already researched in this project (way back, video summary, stateful orchestration): a
-    periodic pattern-miner (scheduled, mostly deterministic) vs. an ad hoc Analyst sub-agent
-    (SQL-analyst-shaped, answers on-demand questions like "does pacing matter independent of
-    length and niche" via real regression with those as covariates) vs. feature-discovery
-    (already designed). Not built, correctly deferred — zero data exists yet.
-  - Statistical method for mining: simple per-feature tests first (Welch's t-test / Mann-Whitney
-    U for continuous-vs-binary, chi-squared for categorical), NOT random forest (wrong tool for
-    clean interpretable effect-size-with-p-value statements) — regression is a deliberate later
-    upgrade once there's enough volume to control for confounders (e.g. the pacing-independent-
-    of-length-and-niche question). This reasoning exists in chat, not yet written into the doc.
+## What's actually NOT done yet (don't assume otherwise)
+- n8n workflow exists but is inactive — nothing runs on a schedule yet, every run so far has been
+  triggered manually from a terminal.
+- Learn engine (Part 5: pattern mining, insights tables, feature discovery) — designed in
+  `plans/learn-engine-idea-sourcing-architecture.md` but the actual mining/correlation step against
+  the now-fully-v6-annotated 60-video dataset has NOT been run. This is the natural next real step:
+  there's finally a complete, consistent dataset (presenter + scene + copy-technique + shot-level
+  data, all at current schema versions) to mine something from.
+- Instagram scraping account decision (greenbabe vs. secondary) — still unresolved, still blocking
+  Part 3. Untouched for several sessions now.
+- Zero owned content has ever been published (5 draft IG statics sit unpublished in
+  data/assets/) — so insights_owned / real performance-based learning can't start until that
+  manual publish step happens.
 
-## Repo research — corrections made 2026-10-12, keep these straight
-- `vyralcontent/content-skills` — MIT, free, genuinely useful, hook/algorithm hypotheses already
-  folded into playbook v2. Confirmed good.
-- `m13v/social-autoposter` ("S4L") — re-verified 2026-10-12, CORRECTED an earlier wrong
-  characterization (it is NOT a content-performance schema, it's a Reddit/X reply-drafting +
-  autopost plugin). Explicitly kept on the research list per user instruction — they may build a
-  SEPARATE future automation for comment/thread replies, unrelated to Qualume's content-creation
-  engine. Don't pull it into Qualume's scope; it's a parked idea for later, different project.
-- `ViralLab/SMDT` — re-verified 2026-10-12. Its "normalization" = cross-PLATFORM schema
-  standardization (Twitter fields vs Reddit fields -> one shared schema), NOT account-baseline
-  performance normalization. Don't conflate the two meanings — caught and corrected this
-  conflation in docs/cost-tooling-research-2026-10-10.md already.
-- PySceneDetect (pacing/cuts-per-min), beatlyze-analyzer (audio mood, PyPI), Essentia (heavier
-  audio-mood option, MTG) — all confirmed real and usable, in the architecture doc.
+## Immediate next action (pick one, both are real unblocking moves)
+1. Activate the n8n workflow so ingestion runs on a schedule without a terminal session driving it
+   — this is a one click in the n8n UI at this point, everything behind it is already wired and
+   tested live.
+2. Start the actual Learn-engine mining pass (Part 5) against the 60 v6-annotated external videos
+   — first real data run of the pattern-mining design that's existed on paper since 2026-10-12.
+   Welch's t-test / Mann-Whitney U per-feature first, per the design doc — not random forest yet.
 
-## Known gap, not yet fixed
-Instagram scraping account decision (greenbabe vs. secondary) — still unresolved, still blocking
-Part 3. Not touched this session.
-
-## Immediate next action
-Fold the "not yet added" bullet list above into
-`plans/learn-engine-idea-sourcing-architecture.md` as a proper revision (same pattern as its
-existing two prior revisions) before any schema migration gets built. Nothing should be built
-until the watchlist actually has real accounts in it (still zero) — that remains the actual
-unblocking action if the user wants to move from design to real data.
+## Known gaps (not touched recently, still open)
+- Instagram account-risk decision (Part 3) — unresolved.
+- No owned content published — insights_owned pipeline has nothing real to work with yet.
+- Separate test DB — tests still write into the real dev Postgres (Part 1 tech debt, flagged
+  repeatedly, not yet fixed).
