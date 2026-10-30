@@ -27,6 +27,8 @@ from qualume.learn.validation import (
     propose_external_insight,
     seed_owned_insight,
     record_owned_evidence,
+    upsert_external_insight,
+    retire_stale_external_insights,
 )
 
 
@@ -213,3 +215,173 @@ def test_record_owned_evidence_stays_testing_with_thin_or_mixed_evidence(prefix)
 def test_record_owned_evidence_rejects_unknown_owned_insight():
     with pytest.raises(ValueError):
         record_owned_evidence(str(uuid.uuid4()), confirmed=True, content_item_id=str(uuid.uuid4()))
+
+
+def test_upsert_external_insight_inserts_new_row_on_first_call(prefix):
+    insight_id = upsert_external_insight(
+        statement=f"{prefix}format_tag=voiceover_broll underperforms",
+        effect_size=0.57, sample_size=60, p_value=0.0021,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"},
+    )
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tier, sample_size, state_history FROM insights_external WHERE id = %s",
+                (insight_id,),
+            )
+            tier, sample_size, state_history = cur.fetchone()
+    finally:
+        conn.close()
+    assert tier == "proposed"
+    assert sample_size == 60
+    assert len(state_history) == 1
+    assert state_history[0]["event"] == "proposed"
+
+
+def test_upsert_external_insight_refreshes_same_identity_instead_of_duplicating(prefix):
+    """The real point: a scheduled mining pass re-running the SAME finding
+    (same identity) every cycle must update one row, not pile up N
+    duplicate 'proposed' rows for an unchanged claim."""
+    identity = {"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"}
+    first_id = upsert_external_insight(
+        statement=f"{prefix}format_tag=voiceover_broll underperforms (n=60)",
+        effect_size=0.57, sample_size=60, p_value=0.0021,
+        applies_to_workflow_type="tiktok_video", identity=identity,
+    )
+    second_id = upsert_external_insight(
+        statement=f"{prefix}format_tag=voiceover_broll underperforms (n=95)",
+        effect_size=0.61, sample_size=95, p_value=0.0015,
+        applies_to_workflow_type="tiktok_video", identity=identity,
+    )
+    assert first_id == second_id  # same row, refreshed, not a new one
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM insights_external WHERE id = %s",
+                (first_id,),
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute(
+                "SELECT sample_size, p_value, state_history FROM insights_external WHERE id = %s",
+                (first_id,),
+            )
+            sample_size, p_value, state_history = cur.fetchone()
+    finally:
+        conn.close()
+    assert sample_size == 95  # latest numbers, not the first pass's stale ones
+    assert float(p_value) == 0.0015
+    assert len(state_history) == 2  # proposed, then refreshed — full history kept
+    assert state_history[1]["event"] == "refreshed"
+
+
+def test_upsert_external_insight_different_identity_creates_a_separate_row(prefix):
+    id_a = upsert_external_insight(
+        statement=f"{prefix}format_tag=voiceover_broll underperforms",
+        effect_size=0.57, sample_size=60, p_value=0.0021,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"},
+    )
+    id_b = upsert_external_insight(
+        statement=f"{prefix}hook_pain_callout underperforms",
+        effect_size=0.76, sample_size=60, p_value=0.0398,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_copy_analysis.hook_pain_callout", "value": True},
+    )
+    assert id_a != id_b
+
+
+def test_upsert_external_insight_never_overwrites_a_different_source(prefix):
+    """A hand-authored insight (source != 'internal_mining') that happens to
+    share an identity must never get silently clobbered by an automatic
+    mining-pass upsert."""
+    manual_id = upsert_external_insight(
+        statement=f"{prefix}manually curated claim",
+        effect_size=0.5, sample_size=10, p_value=0.01,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "manual_review", "value": "x"},
+        source="manual",
+    )
+    auto_id = upsert_external_insight(
+        statement=f"{prefix}mining found the same identity string",
+        effect_size=0.9, sample_size=60, p_value=0.001,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "manual_review", "value": "x"},
+        source="internal_mining",
+    )
+    assert manual_id != auto_id
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT statement, source FROM insights_external WHERE id = %s", (manual_id,))
+            statement, source = cur.fetchone()
+    finally:
+        conn.close()
+    assert source == "manual"
+    assert "manually curated claim" in statement  # untouched by the auto upsert
+
+
+def test_retire_stale_external_insights_retires_no_longer_significant_proposed_rows(prefix):
+    identity_a = {"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"}
+    identity_b = {"mined_from": "external_copy_analysis.hook_pain_callout", "value": True}
+    id_a = upsert_external_insight(
+        statement=f"{prefix}finding A", effect_size=0.57, sample_size=60, p_value=0.0021,
+        applies_to_workflow_type="tiktok_video", identity=identity_a,
+    )
+    id_b = upsert_external_insight(
+        statement=f"{prefix}finding B", effect_size=0.76, sample_size=60, p_value=0.0398,
+        applies_to_workflow_type="tiktok_video", identity=identity_b,
+    )
+
+    # Next mining pass: only finding A is still significant.
+    retired = retire_stale_external_insights(
+        applies_to_workflow_type="tiktok_video",
+        still_significant_identities=[identity_a],
+    )
+    assert retired == 1
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tier FROM insights_external WHERE id = %s", (id_a,))
+            tier_a = cur.fetchone()[0]
+            cur.execute("SELECT tier, state_history FROM insights_external WHERE id = %s", (id_b,))
+            tier_b, state_history_b = cur.fetchone()
+    finally:
+        conn.close()
+    assert tier_a == "proposed"  # still significant, untouched
+    assert tier_b == "retired"
+    assert state_history_b[-1]["event"] == "retired"
+
+
+def test_retire_stale_external_insights_never_touches_accepted_or_testing_tier(prefix):
+    identity = {"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"}
+    insight_id = upsert_external_insight(
+        statement=f"{prefix}finding", effect_size=0.57, sample_size=60, p_value=0.0021,
+        applies_to_workflow_type="tiktok_video", identity=identity,
+    )
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE insights_external SET tier = 'accepted' WHERE id = %s", (insight_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    retired = retire_stale_external_insights(
+        applies_to_workflow_type="tiktok_video", still_significant_identities=[],
+    )
+    assert retired == 0
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tier FROM insights_external WHERE id = %s", (insight_id,))
+            tier = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert tier == "accepted"  # never demoted by a mining pass, only proposed-tier is

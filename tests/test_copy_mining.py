@@ -151,3 +151,43 @@ def test_mineable_copy_flags_covers_all_22_real_taxonomy_flags():
     assert "hook_pain_callout" in MINEABLE_COPY_FLAGS
     assert "external_content_item_id" not in MINEABLE_COPY_FLAGS
     assert "raw_response" not in MINEABLE_COPY_FLAGS
+
+
+def test_mine_boolean_copy_feature_counts_each_video_once_even_with_multiple_performance_snapshots(
+        fake_account):
+    """Same real bug, same fix, as mining.py's regression test of the
+    same name: the JOIN against external_performance_snapshots matched
+    EVERY snapshot row for a video (3 rows for a video re-polled 3 times
+    on the real production account), triple-counting that single
+    observation and corrupting every p-value via pseudo-replication.
+    Must use only the LATEST snapshot per video."""
+    account_id, _ = fake_account
+    item_id = _insert_item_with_flag_and_views(account_id, "creates_urgency", True, 5000)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 5100, 0, 0, 0, now() + interval '1 hour')""",
+                (item_id,),
+            )
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 5200, 0, 0, 0, now() + interval '2 hour')""",
+                (item_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    # pad with 4 more True + 5 False, same shape as the existing smoke test
+    for _ in range(4):
+        _insert_item_with_flag_and_views(account_id, "creates_urgency", True, 5000)
+    for _ in range(5):
+        _insert_item_with_flag_and_views(account_id, "creates_urgency", False, 1000)
+
+    result = mine_boolean_copy_feature("creates_urgency", watched_account_id=account_id)
+
+    assert result is not None
+    assert result["n_true"] == 5  # NOT 7 (the re-polled video triple-counted)

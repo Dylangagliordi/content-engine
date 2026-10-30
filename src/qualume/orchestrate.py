@@ -19,6 +19,7 @@ from qualume.annotate.copy_classifier import classify_and_store_external
 from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALYSIS_PROMPT_VERSION
 from qualume.annotate.gemini_watcher import annotate_and_store
 from qualume.ingest.tiktok_reader import download_pending_videos
+from qualume.learn.run_mining_pass import run_mining_pass
 from qualume.poll_tiktok_watchlist import run_poll_cycle
 
 
@@ -100,12 +101,23 @@ def _run_stage_over_items(items: list[str], fn) -> dict:
 
 def run_ingestion_cycle() -> dict:
     """Run one full cycle. Returns a dict with one key per stage
-    (poll/download/annotation/classification); a stage that raised
+    (poll/download/annotation/classification/mining); a stage that raised
     entirely (not a per-item failure, a whole-stage failure, e.g.
     run_poll_cycle itself raising) is recorded as {"error": "..."} for
     that stage rather than aborting the remaining stages — whatever
     videos are ALREADY downloaded should still get annotated/classified
-    even if this cycle's poll attempt failed outright."""
+    even if this cycle's poll attempt failed outright.
+
+    Mining is the 5th stage (added 2026-10-30): turns the same cycle that
+    just ingested new external data into the trigger for re-running Part
+    5b's statistical pass over the WHOLE dataset (not just what's new this
+    cycle — the pattern-mining primitives always query everything with
+    performance data, same as a manual run). learn.run_mining_pass is
+    itself idempotent on repeat calls (upsert keyed on stable identity,
+    not a blind insert), so running it every 6 hours alongside ingestion
+    is safe and is what actually keeps insights_external current as the
+    dataset grows, instead of needing someone to remember to run it by
+    hand."""
     result: dict = {}
 
     try:
@@ -131,5 +143,15 @@ def run_ingestion_cycle() -> dict:
         )
     except Exception as e:
         result["classification"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # tiktok_reels is the only real workflow_type with external data
+        # today (watched_accounts is TikTok-only so far) — hardcoded here,
+        # not read from anywhere dynamic, same as run_batch.py's own
+        # workflow_type handling; becomes a real parameter the day a
+        # second external-reading workflow (e.g. Instagram) exists.
+        result["mining"] = run_mining_pass(applies_to_workflow_type="tiktok_reels")
+    except Exception as e:
+        result["mining"] = {"error": f"{type(e).__name__}: {e}"}
 
     return result

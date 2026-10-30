@@ -77,6 +77,21 @@ def mine_categorical_feature(column: str, min_group_size: int = 5) -> list[dict]
                           SELECT id FROM external_creative_dna ecd2
                           WHERE ecd2.external_content_item_id = ecd.external_content_item_id
                           ORDER BY analyzed_at DESC LIMIT 1
+                      )
+                      -- SAME discipline, SAME real bug class, found
+                      -- 2026-10-30 against the actual 95-video production
+                      -- dataset once scheduled polling started refreshing
+                      -- existing videos' snapshots: the JOIN above matches
+                      -- EVERY snapshot row for a video, not just its
+                      -- latest. A video polled 3 times got pseudo-
+                      -- replicated 3x (180 rows showed up for 95 videos),
+                      -- artificially shrinking every p-value. Must match
+                      -- only the latest snapshot per video, same pattern
+                      -- as the annotation-version fix just above.
+                      AND eps.id = (
+                          SELECT id FROM external_performance_snapshots eps2
+                          WHERE eps2.external_content_item_id = ecd.external_content_item_id
+                          ORDER BY eps2.ts DESC LIMIT 1
                       )"""
             )
             rows = cur.fetchall()

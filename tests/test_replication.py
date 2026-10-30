@@ -197,3 +197,56 @@ def test_replication_handles_zero_qualifying_segments():
     )
     assert result["n_segments_tested"] == 0
     assert result["replicates"] is None  # not "False" - genuinely untested
+
+
+def test_replication_counts_each_video_once_even_with_multiple_performance_snapshots(
+        two_fake_accounts):
+    """Same real bug class, same fix, as mining.py's regression test of
+    the same name: the JOIN against external_performance_snapshots
+    matched EVERY snapshot row for a video, not just its latest. A
+    re-polled video (the real shape scheduled polling now produces) got
+    pseudo-replicated once per snapshot, inflating n_with/n_without and
+    corrupting the replication check's own per-segment sample sizes —
+    concretely, a segment with only 3 REAL videos could wrongly clear a
+    min_group_size of 4 just because one of those videos had multiple
+    snapshot rows. min_group_size=4 here is deliberately set ABOVE the
+    real distinct-video count (3) so the bug (pseudo-replicated rows
+    clearing the threshold) and the fix (correctly NOT clearing it)
+    produce different, discriminating results."""
+    a1, a2 = two_fake_accounts
+    item_id = _insert_video(a1, 1000, "zz_test_repolled")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 1100, 0, 0, 0, now() + interval '1 hour')""",
+                (item_id,),
+            )
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 1200, 0, 0, 0, now() + interval '2 hour')""",
+                (item_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    # 2 more real distinct videos, each with just one snapshot - 3 real
+    # videos total in this group, each with (3, 1, 1) snapshot rows
+    # respectively = 5 total rows if the bug is present, 3 if fixed.
+    for views in [900, 950]:
+        _insert_video(a1, views, "zz_test_repolled")
+    # "without" group padded to clear min_group_size on its own, so this
+    # test isolates the "with" group's pseudo-replication specifically
+    # rather than being skipped for an unrelated reason.
+    for views in [50, 60, 70, 80]:
+        _insert_video(a1, views, "zz_test_other")
+
+    result = check_segment_replication(
+        "hook_type", "zz_test_repolled", segment_by="account", min_group_size=4
+    )
+    # Correct (deduped) behavior: only 3 real videos, below min_group_size=4
+    # -> genuinely untested. The bug would have let 5 pseudo-rows clear it.
+    assert result["n_segments_tested"] == 0

@@ -64,6 +64,153 @@ def propose_external_insight(
         conn.close()
 
 
+def upsert_external_insight(
+    statement: str,
+    effect_size: float,
+    sample_size: int,
+    p_value: float,
+    applies_to_workflow_type: str,
+    identity: dict,
+    source: str = "internal_mining",
+    supporting_data_refs: dict | None = None,
+) -> str:
+    """Create-or-refresh an insights_external row keyed on STABLE identity
+    (applies_to_workflow_type + identity dict, e.g. {"mined_from":
+    "external_creative_dna.format_tag", "value": "voiceover_broll"}) —
+    NOT on the full applies_to_segment blob, because that also carries
+    volatile per-pass numbers (n_with/n_without) that would never match
+    twice and defeat any upsert matching. This is what makes a scheduled,
+    automatic re-mining pass (orchestrate.run_ingestion_cycle's mining
+    stage) safe to run repeatedly without creating duplicate rows for the
+    same underlying finding every single cycle.
+
+    Behavior:
+    - No existing row with this (workflow_type, identity, source) ->
+      INSERT new, tier='proposed', state_history=[{"event": "proposed", ...}].
+    - Existing row found -> UPDATE statement/effect_size/sample_size/
+      p_value/supporting_data_refs in place. An insight's CURRENT
+      best-evidence numbers belong in one row that gets refreshed, not N
+      duplicate proposals for the same claim every cycle — state_history
+      is where the full history actually lives, appended to on every
+      refresh, never overwritten.
+
+    Only ever touches `source`-matching rows (default 'internal_mining')
+    so a hand-authored insight (source='manual' or similar) is never
+    silently overwritten by an automatic mining pass that happens to
+    compute the same identity.
+
+    Returns the insights_external row id (new or existing)."""
+    from qualume.db.connection import get_connection
+    import json
+    from datetime import datetime, timezone
+
+    identity_json = json.dumps(identity, sort_keys=True)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, state_history FROM insights_external
+                   WHERE applies_to_workflow_type = %s
+                     AND source = %s
+                     AND applies_to_segment -> 'identity' = %s::jsonb""",
+                (applies_to_workflow_type, source, identity_json),
+            )
+            row = cur.fetchone()
+
+            segment_payload = {
+                "identity": identity,
+                **(supporting_data_refs or {}),
+            }
+
+            if row is None:
+                state_history = [{"event": "proposed", "at": now, "p_value": p_value,
+                                   "sample_size": sample_size}]
+                cur.execute(
+                    """INSERT INTO insights_external
+                       (statement, effect_size, sample_size, p_value,
+                        applies_to_workflow_type, applies_to_segment, source,
+                        state_history)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (statement, effect_size, sample_size, p_value,
+                     applies_to_workflow_type, json.dumps(segment_payload), source,
+                     json.dumps(state_history)),
+                )
+                insight_id = cur.fetchone()[0]
+            else:
+                insight_id, state_history = row
+                state_history = list(state_history or [])
+                state_history.append({"event": "refreshed", "at": now, "p_value": p_value,
+                                       "sample_size": sample_size})
+                cur.execute(
+                    """UPDATE insights_external
+                       SET statement = %s, effect_size = %s, sample_size = %s,
+                           p_value = %s, applies_to_segment = %s, state_history = %s
+                       WHERE id = %s""",
+                    (statement, effect_size, sample_size, p_value,
+                     json.dumps(segment_payload), json.dumps(state_history), insight_id),
+                )
+        conn.commit()
+        return str(insight_id)
+    finally:
+        conn.close()
+
+
+def retire_stale_external_insights(
+    applies_to_workflow_type: str, still_significant_identities: list[dict],
+    source: str = "internal_mining",
+) -> int:
+    """Any 'proposed'-tier, source-matching insights_external row for this
+    workflow_type whose identity is NOT in still_significant_identities
+    (this mining pass's real current findings) gets marked tier='retired'
+    with a reason logged to state_history — more data came in and the
+    effect no longer clears significance. Never touches 'accepted' or
+    'testing' tier rows (those have real owned-evidence backing beyond
+    just this mining pass) or non-'internal_mining' sources (never
+    silently retire a hand-authored insight).
+
+    Returns the number of rows retired."""
+    from qualume.db.connection import get_connection
+    import json
+    from datetime import datetime, timezone
+
+    still_significant_json = {json.dumps(i, sort_keys=True) for i in still_significant_identities}
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, applies_to_segment, state_history FROM insights_external
+                   WHERE applies_to_workflow_type = %s AND source = %s AND tier = 'proposed'""",
+                (applies_to_workflow_type, source),
+            )
+            rows = cur.fetchall()
+
+            retired = 0
+            for insight_id, segment, state_history in rows:
+                identity = (segment or {}).get("identity")
+                if identity is None:
+                    continue
+                if json.dumps(identity, sort_keys=True) in still_significant_json:
+                    continue
+                state_history = list(state_history or [])
+                state_history.append({"event": "retired", "at": now,
+                                       "reason": "no longer statistically significant"})
+                cur.execute(
+                    """UPDATE insights_external SET tier = 'retired', state_history = %s
+                       WHERE id = %s""",
+                    (json.dumps(state_history), insight_id),
+                )
+                retired += 1
+        conn.commit()
+        return retired
+    finally:
+        conn.close()
+
+
 def seed_owned_insight(external_insight_id: str, applies_to_workflow_type: str) -> str:
     """Create the linked insights_owned row for an external insight that's
     being tested against OUR account (real experiments row with a stated

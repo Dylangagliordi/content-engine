@@ -148,6 +148,56 @@ def test_mine_categorical_feature_rejects_unknown_column():
         mine_categorical_feature("hook_type; DROP TABLE insights_external;--")
 
 
+def test_mine_categorical_feature_counts_each_video_once_even_with_multiple_performance_snapshots(
+        fake_account):
+    """Regression test for a real bug found running this against the
+    actual 95-video production dataset after scheduled polling began
+    refreshing existing videos' snapshots: the JOIN against
+    external_performance_snapshots matches EVERY snapshot row for a
+    video, not just the latest. A video polled 3 times (3 snapshot rows,
+    the real shape poll_tiktok_watchlist now produces on every scheduled
+    refresh) got its single hook_type value counted 3 TIMES with 3
+    (possibly near-identical) ratio_to_median values — real production
+    run showed 180 rows for 95 videos, artificially inflating every
+    sample size and making p-values implausibly small via
+    pseudo-replication (the same observation isn't 3 independent data
+    points just because it was polled 3 times). Must use only the
+    LATEST snapshot per video, same "one row per video" discipline this
+    function already applies to multi-version annotations."""
+    account_id, _ = fake_account
+    item_id = _insert_video(account_id, 500, "zz_test_repolled", energy_level=3)
+    # simulate 2 MORE snapshots for the SAME video (same real shape as
+    # scheduled re-polling) - without the fix, this video now counts 3x.
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 600, 0, 0, 0, now() + interval '1 hour')""",
+                (item_id,),
+            )
+            cur.execute(
+                """INSERT INTO external_performance_snapshots
+                   (external_content_item_id, views, likes, comments, shares, ts)
+                   VALUES (%s, 700, 0, 0, 0, now() + interval '2 hour')""",
+                (item_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    # pad both groups above min_group_size so they'd otherwise be tested
+    for views in [100, 200, 300, 400]:
+        _insert_video(account_id, views, "zz_test_repolled", energy_level=3)
+        _insert_video(account_id, views, "zz_test_control", energy_level=3)
+
+    results = mine_categorical_feature("hook_type", min_group_size=3)
+    by_value = {r["value"]: r for r in results}
+    # 4 padding + this 1 re-polled video = 5, NOT 5 padding-equivalents
+    # worth of weight from the re-polled video alone being triple-counted.
+    assert by_value["zz_test_repolled"]["n_with"] == 5
+
+
 def test_mine_categorical_feature_counts_each_video_once_even_with_multiple_annotation_versions(
         fake_account):
     """Regression test for a real bug found running this against the

@@ -75,6 +75,17 @@ def check_segment_replication(
                           SELECT id FROM external_creative_dna ecd2
                           WHERE ecd2.external_content_item_id = ecd.external_content_item_id
                           ORDER BY analyzed_at DESC LIMIT 1
+                      )
+                      -- latest performance_snapshot per video only - same
+                      -- real bug class as mining.py's fix of the same
+                      -- name, found 2026-10-30 against the actual
+                      -- 95-video production dataset once scheduled
+                      -- polling started refreshing existing videos'
+                      -- snapshots.
+                      AND eps.id = (
+                          SELECT id FROM external_performance_snapshots eps2
+                          WHERE eps2.external_content_item_id = ecd.external_content_item_id
+                          ORDER BY eps2.ts DESC LIMIT 1
                       )"""
             )
             rows = cur.fetchall()

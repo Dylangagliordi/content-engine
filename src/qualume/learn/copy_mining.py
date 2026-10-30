@@ -76,6 +76,17 @@ def mine_boolean_copy_feature(
                           SELECT id FROM external_copy_analysis eca2
                           WHERE eca2.external_content_item_id = eca.external_content_item_id
                           ORDER BY analyzed_at DESC LIMIT 1
+                      )
+                      -- latest performance_snapshot per video only - same
+                      -- real bug class, found 2026-10-30 against the
+                      -- actual 95-video production dataset: without this
+                      -- a re-polled video (now the real shape scheduled
+                      -- polling produces) is pseudo-replicated once per
+                      -- snapshot row instead of counted once.
+                      AND eps.id = (
+                          SELECT id FROM external_performance_snapshots eps2
+                          WHERE eps2.external_content_item_id = eca.external_content_item_id
+                          ORDER BY eps2.ts DESC LIMIT 1
                       )"""
             params: list = []
             if watched_account_id is not None:
