@@ -1,51 +1,73 @@
-# Qualume — Session Handoff (2026-10-28)
+# Qualume — Session Handoff (2026-10-30)
 
 ## Start here next session
 Read this file first, not chat history. Detail docs referenced below have the full writeups.
 
 ## Project state (all verified, not assumed)
-- 238/238 tests passing. Git clean.
-- Watchlist: 2 TikTok accounts active (@pinkstork, @wishgardenherbs, both `watchlist_type=competitor`).
-- 60 external_content_items ingested. ALL 60 now annotated at v6 (presenter/avatar + scene
-  description) — backfill completed 2026-10-28, verified against real DB rows (not mocked).
-  Two of the 60 initially had no downloaded video file (`local_video_path` NULL); ran
-  `tiktok_reader.download_pending_videos()` to pull them, then annotated — both succeeded.
-- Gemini's earlier persistent 503 ("high demand") outage on `gemini-3.1-flash-lite` has cleared.
-  Confirmed via live calls, not assumption — note if it recurs, it's a known transient external
-  issue, not a code bug (same pattern seen before).
-- Copy-technique classifier v2 (ordered 22-flag technique sequence) built and live-verified
-  2026-10-17/19, improved accuracy over v1 on the same real video.
-- n8n (`qualume-n8n` container, OrbStack, localhost:5678, healthz OK) wired to a real local HTTP
-  server wrapping the ingestion pipeline (`host.docker.internal`). Workflow (Schedule -> HTTP ->
-  /run-ingestion-cycle -> poll -> download -> Gemini -> Claude -> mine) is IMPORTED into n8n's UI
-  but NOT YET ACTIVATED — still a manual step for the user.
-- Hermes runs on Claude Pro subscription auth (CLAUDE_CODE_OAUTH_TOKEN), not API credits. Qualume's
-  own `.env` ANTHROPIC_API_KEY is separate and unaffected. Three distinct cost meters.
+- 255/255 tests passing. Git clean.
+- Watchlist: 2 TikTok accounts active (@pinkstork, @wishgardenherbs). A leaked test fixture
+  account (test_orch_ad047945) was found active in the REAL watchlist and getting polled on
+  real scheduled cycles — found via the live server's error log, deleted, confirmed clean.
+- 95 external_content_items, all 95 fully annotated (v6 presenter/scene) and copy-classified
+  (22-flag taxonomy). n8n's scheduled polling found 35 new videos beyond the original 60 this
+  session — confirms the pipeline is actually discovering new content, not just idle.
+- n8n (`qualume-n8n` container, localhost:5678) workflow is PUBLISHED/ACTIVE — real scheduled
+  runs every 6 hours, confirmed live (manually triggered one, watched it actually poll/download/
+  annotate/classify real new content end to end).
+- Orchestration server (`qualume.server`) now runs as a real launchd user service
+  (`~/Library/LaunchAgents/com.qualume.orchestration-server.plist`), not a manually-started
+  terminal process. RunAtLoad + KeepAlive — survives logout and Mac restart, auto-restarts on
+  crash (verified live: kill -9'd the real PID, launchd relaunched within 3s). Does NOT survive
+  the Mac sleeping/being off — that's still the N100/always-on-host migration, unchanged.
+- Part 5b (pattern mining) is now AUTOMATED, not a manual script: `learn.run_mining_pass.
+  run_mining_pass()` runs as run_ingestion_cycle's 5th stage on every 6h cycle. Tests every
+  mineable DNA column + all 22 copy-technique flags, upserts p<0.05 findings into
+  insights_external (keyed on stable identity so repeat runs refresh in place, not duplicate),
+  retires proposed-tier rows that stop clearing significance. Currently 7 real findings
+  (n=95, properly deduped) — see below for what they say.
+
+## Two real bugs found and fixed this session (both via live verification, not assumed)
+1. **orchestrate.py hardcoded 'v5'** in both find_pending_annotation and
+   find_pending_classification's SQL, left over from before the v6 schema bump. Every newly-
+   annotated-at-v6 video silently never got picked up for classification — no error, just
+   permanently missing data. Fixed: both now import the live ANALYSIS_PROMPT_VERSION constant.
+2. **Pseudo-replication in all 3 mining modules** (learn.mining, learn.copy_mining,
+   learn.replication) — none of them filtered external_performance_snapshots to each video's
+   LATEST row. Once scheduled polling started re-polling existing videos (2-3 snapshot rows per
+   video), every statistical test counted the same video 2-3x as independent observations,
+   artificially shrinking every p-value. A real run before the fix showed 22/49 "significant"
+   findings; after the fix, 7/46 on the identical dataset — the former was mostly this bug.
+   Fixed: all 3 modules now join against only each video's latest snapshot by timestamp.
+
+## Current real insights_external findings (tier=proposed, n=95, all source=internal_mining)
+1. format_tag='talking_head' outperforms (1.35x vs 0.94x baseline, p=0.0036)
+2. copy technique hook_promise_without_mechanism outperforms (p=0.0069)
+3. format_tag='voiceover_broll' underperforms (0.73x vs baseline, p=0.0109)
+4. copy technique hook_pain_callout underperforms (p=0.0112)
+5. caption_style='none' underperforms (0.33x vs baseline, p=0.0195)
+6. copy technique creates_urgency outperforms (1.91x, p=0.0440)
+7. hook_type='question' outperforms (1.63x, p=0.0490)
+All proposed-tier, n=95, correlational not causal — low confidence by design until owned
+evidence (Part 5c/experiments loop) tests them against OUR OWN account, which requires
+publishing owned content first (still zero published).
 
 ## What's actually NOT done yet (don't assume otherwise)
-- n8n workflow exists but is inactive — nothing runs on a schedule yet, every run so far has been
-  triggered manually from a terminal.
-- Learn engine (Part 5: pattern mining, insights tables, feature discovery) — designed in
-  `plans/learn-engine-idea-sourcing-architecture.md` but the actual mining/correlation step against
-  the now-fully-v6-annotated 60-video dataset has NOT been run. This is the natural next real step:
-  there's finally a complete, consistent dataset (presenter + scene + copy-technique + shot-level
-  data, all at current schema versions) to mine something from.
-- Instagram scraping account decision (greenbabe vs. secondary) — still unresolved, still blocking
-  Part 3. Untouched for several sessions now.
-- Zero owned content has ever been published (5 draft IG statics sit unpublished in
-  data/assets/) — so insights_owned / real performance-based learning can't start until that
-  manual publish step happens.
+- No owned content has ever been published (5 draft IG statics sit unpublished in
+  data/assets/) — insights_owned / real performance-based learning can't start until that
+  manual publish step happens. The 7 insights_external findings above are external-only,
+  capped at lower trust by design until tested against owned data.
+- Part 5c (playbook authoring from accepted-tier insights) not started — nothing is
+  accepted-tier yet, nothing has graduated past proposed.
+- Instagram scraping account decision (Part 3) — still unresolved, untouched for weeks.
+- Separate test DB — tests still write into the real dev Postgres (flagged repeatedly,
+  not yet fixed). This session specifically found a real leaked test row in production data
+  from this exact gap — worth prioritizing before it recurs.
 
-## Immediate next action (pick one, both are real unblocking moves)
-1. Activate the n8n workflow so ingestion runs on a schedule without a terminal session driving it
-   — this is a one click in the n8n UI at this point, everything behind it is already wired and
-   tested live.
-2. Start the actual Learn-engine mining pass (Part 5) against the 60 v6-annotated external videos
-   — first real data run of the pattern-mining design that's existed on paper since 2026-10-12.
-   Welch's t-test / Mann-Whitney U per-feature first, per the design doc — not random forest yet.
-
-## Known gaps (not touched recently, still open)
-- Instagram account-risk decision (Part 3) — unresolved.
-- No owned content published — insights_owned pipeline has nothing real to work with yet.
-- Separate test DB — tests still write into the real dev Postgres (Part 1 tech debt, flagged
-  repeatedly, not yet fixed).
+## Immediate next action (pick one)
+1. Let the automated pipeline run for a while (days) and watch the 7 insights stabilize or
+   shift as more data comes in via scheduled polling — nothing urgent to build, just observe.
+2. Publish one of the 5 draft IG statics to start the insights_owned / real validation loop —
+   the actual mechanism (learn.validation.seed_owned_insight / record_owned_evidence) is already
+   built and tested, just waiting on real owned performance data to mean anything.
+3. Finally build the separate test DB (Part 1 tech debt) — this session's leaked-fixture-in-
+   production incident is a concrete argument for prioritizing it now rather than later.
