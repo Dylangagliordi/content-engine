@@ -102,3 +102,35 @@ def test_list_watched_accounts_filters_by_watchlist_type():
     finally:
         _cleanup(competitor)
         _cleanup(cross)
+
+
+def test_add_watched_account_niche_defaults_to_none():
+    """niche is a real topic/vertical field (e.g. 'women's health
+    supplements'), deliberately separate from watchlist_type (which is
+    about WHY we track an account relative to us, not WHAT it's about).
+    Nullable by design — an account added without a niche shouldn't
+    silently get a fabricated default, same discipline as every other
+    optional field in this schema."""
+    handle = f"test_niche_default_{uuid.uuid4().hex[:8]}"
+    _cleanup(handle)
+    try:
+        add_watched_account("tiktok", handle)
+        accounts = list_watched_accounts(platform="tiktok", active_only=True)
+        match = [a for a in accounts if a["handle"] == handle]
+        assert len(match) == 1
+        assert match[0]["niche"] is None
+    finally:
+        _cleanup(handle)
+
+
+def test_add_watched_account_persists_explicit_niche():
+    handle = f"test_niche_explicit_{uuid.uuid4().hex[:8]}"
+    _cleanup(handle)
+    try:
+        add_watched_account("tiktok", handle, niche="women's health supplements")
+        accounts = list_watched_accounts(platform="tiktok", active_only=True)
+        match = [a for a in accounts if a["handle"] == handle]
+        assert len(match) == 1
+        assert match[0]["niche"] == "women's health supplements"
+    finally:
+        _cleanup(handle)

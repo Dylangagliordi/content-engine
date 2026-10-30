@@ -19,6 +19,7 @@ from qualume.annotate.copy_classifier import classify_and_store_external
 from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALYSIS_PROMPT_VERSION
 from qualume.annotate.gemini_watcher import annotate_and_store
 from qualume.ingest.tiktok_reader import download_pending_videos
+from qualume.learn.run_cluster_pass import run_cluster_pass
 from qualume.learn.run_mining_pass import run_mining_pass
 from qualume.poll_tiktok_watchlist import run_poll_cycle
 
@@ -101,7 +102,7 @@ def _run_stage_over_items(items: list[str], fn) -> dict:
 
 def run_ingestion_cycle() -> dict:
     """Run one full cycle. Returns a dict with one key per stage
-    (poll/download/annotation/classification/mining); a stage that raised
+    (poll/download/annotation/classification/mining/clustering); a stage that raised
     entirely (not a per-item failure, a whole-stage failure, e.g.
     run_poll_cycle itself raising) is recorded as {"error": "..."} for
     that stage rather than aborting the remaining stages — whatever
@@ -153,5 +154,15 @@ def run_ingestion_cycle() -> dict:
         result["mining"] = run_mining_pass(applies_to_workflow_type="tiktok_reels")
     except Exception as e:
         result["mining"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # Phase B (clustering) — 6th stage, added 2026-10-30. Same
+        # tiktok_reels hardcode as the mining stage above, same reasoning.
+        # Runs independently of the mining stage (Phase A/declared-
+        # taxonomy) — a Voyage outage or embedding failure here must not
+        # block the already-proven mining pass, and vice versa.
+        result["clustering"] = run_cluster_pass(applies_to_workflow_type="tiktok_reels")
+    except Exception as e:
+        result["clustering"] = {"error": f"{type(e).__name__}: {e}"}
 
     return result

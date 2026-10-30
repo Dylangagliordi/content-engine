@@ -1,0 +1,21 @@
+-- watched_accounts.niche: a real topic/vertical field (e.g. "women's
+-- health supplements", "fitness", "finance"), separate from the
+-- existing watchlist_type column. watchlist_type is about WHY we track
+-- an account relative to US (competitor/aspirational/cross_niche/
+-- emerging/format_specific); niche is about WHAT the account's content
+-- is actually about. Conflating the two was a real gap this session:
+-- both current accounts share watchlist_type='competitor' but there was
+-- no field at all for the topic itself.
+--
+-- Deliberately NOT baked into transcript embeddings or clustering logic
+-- as a hard dimension — per explicit user decision this session, niche
+-- stays a lightweight informational/diversity signal reported ALONGSIDE
+-- cluster findings (same spirit as learn.replication's existing
+-- cross-account/cross-niche check), not a thing clustering depends on.
+-- This keeps the clustering pipeline portable to a DIFFERENT business's
+-- accounts later without the schema or code assuming "our niche".
+--
+-- Nullable: real accounts added before this migration (pinkstork,
+-- wishgardenherbs) don't have a value yet and shouldn't silently get a
+-- fabricated default — NULL means "not yet classified", not "no niche".
+ALTER TABLE watched_accounts ADD COLUMN niche TEXT;

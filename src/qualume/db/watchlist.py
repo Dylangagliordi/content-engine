@@ -2,17 +2,25 @@ from qualume.db.connection import get_connection
 
 
 def add_watched_account(
-    platform: str, handle: str, notes: str | None = None, watchlist_type: str = "general"
+    platform: str, handle: str, notes: str | None = None, watchlist_type: str = "general",
+    niche: str | None = None,
 ) -> str:
     """Register an account to poll. Raises on duplicate (platform, handle) —
-    fail loud rather than silently ignoring a re-add attempt."""
+    fail loud rather than silently ignoring a re-add attempt.
+
+    niche: a real topic/vertical (e.g. "women's health supplements",
+    "fitness", "finance"), deliberately SEPARATE from watchlist_type
+    (which is about WHY we track an account relative to US —
+    competitor/aspirational/cross_niche/etc — not WHAT its content is
+    about). Nullable — an account added without a niche shouldn't
+    silently get a fabricated default; NULL means "not yet classified"."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO watched_accounts (platform, handle, notes, watchlist_type)
-                   VALUES (%s, %s, %s, %s) RETURNING id""",
-                (platform, handle, notes, watchlist_type),
+                """INSERT INTO watched_accounts (platform, handle, notes, watchlist_type, niche)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+                (platform, handle, notes, watchlist_type, niche),
             )
             account_id = cur.fetchone()[0]
         conn.commit()
@@ -28,7 +36,7 @@ def list_watched_accounts(
     try:
         with conn.cursor() as cur:
             query = (
-                "SELECT id, platform, handle, active, notes, watchlist_type"
+                "SELECT id, platform, handle, active, notes, watchlist_type, niche"
                 " FROM watched_accounts WHERE 1=1"
             )
             params = []
@@ -47,7 +55,7 @@ def list_watched_accounts(
 
     return [
         {"id": str(r[0]), "platform": r[1], "handle": r[2], "active": r[3], "notes": r[4],
-         "watchlist_type": r[5]}
+         "watchlist_type": r[5], "niche": r[6]}
         for r in rows
     ]
 

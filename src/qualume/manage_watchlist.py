@@ -25,6 +25,8 @@ def main():
     add_p.add_argument("--notes", default=None)
     add_p.add_argument("--type", dest="watchlist_type", choices=WATCHLIST_TYPES, default="general",
                        help="Why this account is watched")
+    add_p.add_argument("--niche", default=None,
+                       help="Topic/vertical, e.g. 'women's health supplements' — separate from --type")
 
     list_p = sub.add_parser("list", help="List watched accounts")
     list_p.add_argument("--platform", default=None)
@@ -39,9 +41,11 @@ def main():
 
     if args.command == "add":
         account_id = add_watched_account(
-            args.platform, args.handle, notes=args.notes, watchlist_type=args.watchlist_type
+            args.platform, args.handle, notes=args.notes, watchlist_type=args.watchlist_type,
+            niche=args.niche,
         )
-        print(f"Added @{args.handle} ({args.platform}, {args.watchlist_type}) — id: {account_id}")
+        print(f"Added @{args.handle} ({args.platform}, {args.watchlist_type}"
+              + (f", niche={args.niche}" if args.niche else "") + f") — id: {account_id}")
 
     elif args.command == "list":
         accounts = list_watched_accounts(
@@ -53,6 +57,7 @@ def main():
             status = "active" if a["active"] else "inactive"
             print(f"  [{status}] {a['id']}  @{a['handle']} ({a['platform']})"
                   f"  watchlist_type={a['watchlist_type']}"
+                  + (f"  niche={a['niche']}" if a["niche"] else "")
                   + (f"  — {a['notes']}" if a["notes"] else ""))
 
     elif args.command == "deactivate":

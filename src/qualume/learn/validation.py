@@ -37,11 +37,18 @@ def propose_external_insight(
     p_value: float,
     applies_to_workflow_type: str,
     applies_to_segment: dict | None = None,
+    source: str = "internal_mining",
 ) -> str:
     """Insert a new insights_external row at tier='proposed' — the
     output shape of learn.mining/learn.replication's results, made
     durable and queryable rather than living only in a one-off script's
-    stdout."""
+    stdout.
+
+    source defaults to 'internal_mining' (the declared-taxonomy mining
+    pipeline's own tag) — learn.run_cluster_pass passes
+    source='transcript_clustering' explicitly so its findings are
+    distinguishable and so retire_stale_external_insights' source filter
+    can target exactly one pipeline's rows without touching the other's."""
     from qualume.db.connection import get_connection
     import json
 
@@ -51,11 +58,11 @@ def propose_external_insight(
             cur.execute(
                 """INSERT INTO insights_external
                    (statement, effect_size, sample_size, p_value,
-                    applies_to_workflow_type, applies_to_segment)
-                   VALUES (%s, %s, %s, %s, %s, %s)
+                    applies_to_workflow_type, applies_to_segment, source)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (statement, effect_size, sample_size, p_value,
-                 applies_to_workflow_type, json.dumps(applies_to_segment or {})),
+                 applies_to_workflow_type, json.dumps(applies_to_segment or {}), source),
             )
             insight_id = cur.fetchone()[0]
         conn.commit()
@@ -160,7 +167,7 @@ def upsert_external_insight(
 
 def retire_stale_external_insights(
     applies_to_workflow_type: str, still_significant_identities: list[dict],
-    source: str = "internal_mining",
+    source: str = "internal_mining", retire_all: bool = False,
 ) -> int:
     """Any 'proposed'-tier, source-matching insights_external row for this
     workflow_type whose identity is NOT in still_significant_identities
@@ -168,8 +175,21 @@ def retire_stale_external_insights(
     with a reason logged to state_history — more data came in and the
     effect no longer clears significance. Never touches 'accepted' or
     'testing' tier rows (those have real owned-evidence backing beyond
-    just this mining pass) or non-'internal_mining' sources (never
-    silently retire a hand-authored insight).
+    just this mining pass) or non-matching sources (never silently
+    retire a different pipeline's or a hand-authored insight).
+
+    retire_all=True (added 2026-10-30, real bug fix): bypasses identity
+    matching entirely and retires EVERY proposed, source-matching row —
+    for pipelines whose findings have no stable identity to match against
+    across runs (learn.run_cluster_pass: an HDBSCAN cluster ID isn't the
+    same group of videos next run, so there's nothing to upsert/retire-
+    match against). Without this, rows with no 'identity' key in
+    applies_to_segment (exactly transcript_clustering's shape) were
+    SILENTLY skipped forever by the `if identity is None: continue` path
+    below — a real production run showed 18 duplicate proposed clustering
+    insights pile up across 6 cycles because retired was always 0, even
+    though retire_stale_external_insights was being called every cycle
+    with the clear intent "retire everything from last time".
 
     Returns the number of rows retired."""
     from qualume.db.connection import get_connection
@@ -191,11 +211,12 @@ def retire_stale_external_insights(
 
             retired = 0
             for insight_id, segment, state_history in rows:
-                identity = (segment or {}).get("identity")
-                if identity is None:
-                    continue
-                if json.dumps(identity, sort_keys=True) in still_significant_json:
-                    continue
+                if not retire_all:
+                    identity = (segment or {}).get("identity")
+                    if identity is None:
+                        continue
+                    if json.dumps(identity, sort_keys=True) in still_significant_json:
+                        continue
                 state_history = list(state_history or [])
                 state_history.append({"event": "retired", "at": now,
                                        "reason": "no longer statistically significant"})

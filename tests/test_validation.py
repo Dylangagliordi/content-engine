@@ -385,3 +385,83 @@ def test_retire_stale_external_insights_never_touches_accepted_or_testing_tier(p
     finally:
         conn.close()
     assert tier == "accepted"  # never demoted by a mining pass, only proposed-tier is
+
+
+def test_retire_stale_external_insights_retire_all_ignores_identity_matching_entirely(prefix):
+    """Real bug found and fixed 2026-10-30: rows whose applies_to_segment
+    has no 'identity' key (exactly transcript_clustering's shape — a
+    cluster has no stable identity across runs, by design) were SILENTLY
+    skipped forever by the identity-matching path (`if identity is None:
+    continue`), even when still_significant_identities=[] was passed with
+    the clear intent 'retire everything'. A real production run showed
+    18 duplicate proposed clustering insights accumulate across 6 cycles
+    because of this — retired was always 0. retire_all=True bypasses
+    identity matching entirely and retires every proposed, source-
+    matching row for this workflow_type, independent of what
+    still_significant_identities contains or whether identity exists at
+    all."""
+    propose_external_insight(
+        statement=f"{prefix}cluster finding, no identity key at all",
+        effect_size=0.5, sample_size=8, p_value=0.001,
+        applies_to_workflow_type="tiktok_video",
+        applies_to_segment={"label": "some cluster", "niches": ["x"]},  # no 'identity' key
+        source="transcript_clustering",
+    )
+    propose_external_insight(
+        statement=f"{prefix}another cluster finding, also no identity key",
+        effect_size=0.6, sample_size=6, p_value=0.003,
+        applies_to_workflow_type="tiktok_video",
+        applies_to_segment={"label": "another cluster", "niches": ["x"]},
+        source="transcript_clustering",
+    )
+
+    retired = retire_stale_external_insights(
+        applies_to_workflow_type="tiktok_video",
+        still_significant_identities=[],
+        source="transcript_clustering",
+        retire_all=True,
+    )
+    assert retired == 2
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tier FROM insights_external WHERE statement LIKE %s AND source = 'transcript_clustering'",
+                (f"{prefix}%",),
+            )
+            tiers = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    assert all(t == "retired" for t in tiers)
+
+
+def test_retire_stale_external_insights_retire_all_still_respects_accepted_tier(prefix):
+    """retire_all must still never touch accepted/testing tier — same
+    protection as the identity-matching path, just applied without the
+    identity check."""
+    propose_external_insight(
+        statement=f"{prefix}already accepted cluster finding",
+        effect_size=0.5, sample_size=8, p_value=0.001,
+        applies_to_workflow_type="tiktok_video",
+        applies_to_segment={"label": "some cluster"},
+        source="transcript_clustering",
+    )
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE insights_external SET tier = 'accepted' WHERE statement LIKE %s",
+                (f"{prefix}%",),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    retired = retire_stale_external_insights(
+        applies_to_workflow_type="tiktok_video",
+        still_significant_identities=[],
+        source="transcript_clustering",
+        retire_all=True,
+    )
+    assert retired == 0
