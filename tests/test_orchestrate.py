@@ -22,6 +22,8 @@ from unittest.mock import patch
 
 import pytest
 
+from qualume.annotate.copy_classifier import ANALYSIS_PROMPT_VERSION as COPY_VERSION
+from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_VERSION
 from qualume.db.connection import get_connection
 from qualume.db.watchlist import add_watched_account
 from qualume.orchestrate import (
@@ -82,7 +84,9 @@ def _insert_item(account_id, local_video_path="/fake/path.mp4"):
         conn.close()
 
 
-def _insert_dna(item_id, version="v5"):
+def _insert_dna(item_id, version=None):
+    if version is None:
+        version = DNA_VERSION
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -106,12 +110,17 @@ def fake_account():
     _cleanup_account(handle)
 
 
-def test_find_pending_annotation_returns_items_with_video_but_no_v5_dna(fake_account):
+def test_find_pending_annotation_returns_items_with_video_but_no_current_dna(fake_account):
+    """'Current' = qualume.annotate.gemini_watcher.ANALYSIS_PROMPT_VERSION, read
+    live, not a hardcoded string — this is a regression test for a real bug:
+    orchestrate.py hardcoded 'v5' even after gemini_watcher bumped to v6,
+    silently excluding every v6-only video from ever being found pending
+    (caught running this against real production data, see git log)."""
     account_id, _ = fake_account
     item_with_video = _insert_item(account_id, local_video_path="/real/path.mp4")
     item_no_video = _insert_item(account_id, local_video_path=None)
-    item_already_v5 = _insert_item(account_id, local_video_path="/real/path2.mp4")
-    _insert_dna(item_already_v5, version="v5")
+    item_already_current = _insert_item(account_id, local_video_path="/real/path2.mp4")
+    _insert_dna(item_already_current, version=DNA_VERSION)
     item_only_v1 = _insert_item(account_id, local_video_path="/real/path3.mp4")
     _insert_dna(item_only_v1, version="v1")
 
@@ -119,17 +128,21 @@ def test_find_pending_annotation_returns_items_with_video_but_no_v5_dna(fake_acc
 
     assert item_with_video in pending
     assert item_no_video not in pending  # no video file -> can't annotate
-    assert item_already_v5 not in pending  # already has v5
-    assert item_only_v1 in pending  # only v1 -> still pending for v5
+    assert item_already_current not in pending  # already has the current version
+    assert item_only_v1 in pending  # only v1 -> still pending for the current version
 
 
-def test_find_pending_classification_returns_v5_items_with_no_copy_analysis(fake_account):
+def test_find_pending_classification_returns_current_dna_items_with_no_copy_analysis(fake_account):
+    """Same live-version-constant discipline as find_pending_annotation above
+    — classification pending-check must track gemini_watcher's CURRENT
+    ANALYSIS_PROMPT_VERSION, not a string that goes stale the next time that
+    version bumps."""
     account_id, _ = fake_account
     item_ready = _insert_item(account_id)
-    _insert_dna(item_ready, version="v5")
+    _insert_dna(item_ready, version=DNA_VERSION)
     item_no_dna_yet = _insert_item(account_id)
     item_already_classified = _insert_item(account_id)
-    _insert_dna(item_already_classified, version="v5")
+    _insert_dna(item_already_classified, version=DNA_VERSION)
 
     conn = get_connection()
     try:
@@ -137,8 +150,8 @@ def test_find_pending_classification_returns_v5_items_with_no_copy_analysis(fake
             cur.execute(
                 """INSERT INTO external_copy_analysis
                    (external_content_item_id, analysis_model, analysis_prompt_version)
-                   VALUES (%s, 'claude', 'v1')""",
-                (item_already_classified,),
+                   VALUES (%s, 'claude', %s)""",
+                (item_already_classified, COPY_VERSION),
             )
         conn.commit()
     finally:
@@ -147,8 +160,24 @@ def test_find_pending_classification_returns_v5_items_with_no_copy_analysis(fake
     pending = find_pending_classification(watched_account_id=account_id)
 
     assert item_ready in pending
-    assert item_no_dna_yet not in pending  # no v5 annotation -> nothing to classify from
+    assert item_no_dna_yet not in pending  # no current-version annotation -> nothing to classify from
     assert item_already_classified not in pending
+
+
+def test_find_pending_annotation_treats_a_current_version_item_as_not_pending_even_if_older_versions_also_exist(
+    fake_account,
+):
+    """A video annotated at BOTH v1 and the current version (re-annotation
+    history, same real shape as the v1->v6 backfill already run on
+    production data) must not be reported pending just because an older row
+    exists alongside the current one."""
+    account_id, _ = fake_account
+    item_id = _insert_item(account_id, local_video_path="/real/path4.mp4")
+    _insert_dna(item_id, version="v1")
+    _insert_dna(item_id, version=DNA_VERSION)
+
+    pending = find_pending_annotation(watched_account_id=account_id)
+    assert item_id not in pending
 
 
 def test_run_ingestion_cycle_chains_all_four_stages_and_reports_each(fake_account):

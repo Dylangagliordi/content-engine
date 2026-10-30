@@ -16,16 +16,23 @@ a scheduled, unattended job on an always-on host needs: one bad video or
 one transient API 503 must never silently stop the whole cycle.
 """
 from qualume.annotate.copy_classifier import classify_and_store_external
+from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALYSIS_PROMPT_VERSION
 from qualume.annotate.gemini_watcher import annotate_and_store
 from qualume.ingest.tiktok_reader import download_pending_videos
 from qualume.poll_tiktok_watchlist import run_poll_cycle
 
 
 def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
-    """external_content_items with a local video file but no v5
-    external_creative_dna row yet (an item with only an older version,
-    e.g. v1, still counts as pending — same "always annotate forward to
-    the latest version" discipline the rest of this project uses)."""
+    """external_content_items with a local video file but no row at the
+    CURRENT annotation version yet (qualume.annotate.gemini_watcher.
+    ANALYSIS_PROMPT_VERSION, read live — NOT a hardcoded string. Real bug
+    found and fixed 2026-10-28: this used to hardcode 'v5', so after
+    gemini_watcher bumped to v6 every genuinely-new video silently never
+    got picked up by a scheduled cycle, even though annotate_and_store
+    itself was already producing v6 output correctly when called by hand.
+    An item with only an older version, e.g. v1, still counts as pending —
+    same "always annotate forward to the latest version" discipline the
+    rest of this project uses)."""
     from qualume.db.connection import get_connection
 
     conn = get_connection()
@@ -35,9 +42,9 @@ def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
                        WHERE eci.local_video_path IS NOT NULL
                          AND eci.id NOT IN (
                              SELECT external_content_item_id FROM external_creative_dna
-                             WHERE analysis_prompt_version = 'v5'
+                             WHERE analysis_prompt_version = %s
                          )"""
-            params: list = []
+            params: list = [DNA_ANALYSIS_PROMPT_VERSION]
             if watched_account_id is not None:
                 query += " AND eci.watched_account_id = %s"
                 params.append(watched_account_id)
@@ -48,12 +55,15 @@ def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
 
 
 def find_pending_classification(watched_account_id: str | None = None) -> list[str]:
-    """external_content_items with a v5 annotation but no copy-analysis
-    row yet at all (any version — this module doesn't re-run
-    classification just because a newer ANALYSIS_PROMPT_VERSION exists;
-    that re-running decision is the same kind of explicit, deliberate
-    batch job the v3->v4->v5 Gemini re-annotations were, not something
-    a scheduled cycle does automatically)."""
+    """external_content_items with a CURRENT-version annotation (same live
+    DNA_ANALYSIS_PROMPT_VERSION constant as find_pending_annotation above,
+    same 2026-10-28 bugfix — this used to hardcode 'v5' too, same stale-
+    string failure mode) but no copy-analysis row yet at all (any version
+    — this module doesn't re-run classification just because a newer
+    copy-classifier ANALYSIS_PROMPT_VERSION exists; that re-running
+    decision is the same kind of explicit, deliberate batch job the
+    v3->v4->v5 Gemini re-annotations were, not something a scheduled
+    cycle does automatically)."""
     from qualume.db.connection import get_connection
 
     conn = get_connection()
@@ -62,11 +72,11 @@ def find_pending_classification(watched_account_id: str | None = None) -> list[s
             query = """SELECT DISTINCT ecd.external_content_item_id
                        FROM external_creative_dna ecd
                        JOIN external_content_items eci ON eci.id = ecd.external_content_item_id
-                       WHERE ecd.analysis_prompt_version = 'v5'
+                       WHERE ecd.analysis_prompt_version = %s
                          AND ecd.external_content_item_id NOT IN (
                              SELECT external_content_item_id FROM external_copy_analysis
                          )"""
-            params: list = []
+            params: list = [DNA_ANALYSIS_PROMPT_VERSION]
             if watched_account_id is not None:
                 query += " AND eci.watched_account_id = %s"
                 params.append(watched_account_id)
