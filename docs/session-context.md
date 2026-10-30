@@ -1,73 +1,75 @@
-# Qualume — Session Handoff (2026-10-30)
+# Qualume — Session Handoff (2026-10-30, Phase B built)
 
 ## Start here next session
 Read this file first, not chat history. Detail docs referenced below have the full writeups.
 
-## Project state (all verified, not assumed)
-- 255/255 tests passing. Git clean.
-- Watchlist: 2 TikTok accounts active (@pinkstork, @wishgardenherbs). A leaked test fixture
-  account (test_orch_ad047945) was found active in the REAL watchlist and getting polled on
-  real scheduled cycles — found via the live server's error log, deleted, confirmed clean.
-- 95 external_content_items, all 95 fully annotated (v6 presenter/scene) and copy-classified
-  (22-flag taxonomy). n8n's scheduled polling found 35 new videos beyond the original 60 this
-  session — confirms the pipeline is actually discovering new content, not just idle.
-- n8n (`qualume-n8n` container, localhost:5678) workflow is PUBLISHED/ACTIVE — real scheduled
-  runs every 6 hours, confirmed live (manually triggered one, watched it actually poll/download/
-  annotate/classify real new content end to end).
-- Orchestration server (`qualume.server`) now runs as a real launchd user service
-  (`~/Library/LaunchAgents/com.qualume.orchestration-server.plist`), not a manually-started
-  terminal process. RunAtLoad + KeepAlive — survives logout and Mac restart, auto-restarts on
-  crash (verified live: kill -9'd the real PID, launchd relaunched within 3s). Does NOT survive
-  the Mac sleeping/being off — that's still the N100/always-on-host migration, unchanged.
-- Part 5b (pattern mining) is now AUTOMATED, not a manual script: `learn.run_mining_pass.
-  run_mining_pass()` runs as run_ingestion_cycle's 5th stage on every 6h cycle. Tests every
-  mineable DNA column + all 22 copy-technique flags, upserts p<0.05 findings into
-  insights_external (keyed on stable identity so repeat runs refresh in place, not duplicate),
-  retires proposed-tier rows that stop clearing significance. Currently 7 real findings
-  (n=95, properly deduped) — see below for what they say.
+## Project state (all verified live against real data, not assumed)
+- 282/282 tests passing. Git clean.
+- n8n (`qualume-n8n`, published/active) runs a real 6-stage pipeline every 6 hours via the
+  launchd-managed orchestration server (`~/Library/LaunchAgents/com.qualume.orchestration-
+  server.plist`, RunAtLoad+KeepAlive — survives logout/restart/crash, does NOT survive the
+  Mac sleeping/being off): poll -> download -> annotate -> classify -> mine (declared-taxonomy)
+  -> cluster (emergent/Phase B, new this session).
+- 95 external videos, all fully annotated/classified. 70 have real transcript text and are
+  embedded (Voyage voyage-3.5); 25 genuinely have no spoken copy (product-only/voiceover shots)
+  and are correctly excluded, not a bug.
+- `watched_accounts.niche` (new column) set for both real accounts: "women's health supplements".
+  Purely informational — attached to findings as a tag, never baked into clustering math, so this
+  stays portable to a different business's accounts later (explicit user decision this session).
 
-## Two real bugs found and fixed this session (both via live verification, not assumed)
-1. **orchestrate.py hardcoded 'v5'** in both find_pending_annotation and
-   find_pending_classification's SQL, left over from before the v6 schema bump. Every newly-
-   annotated-at-v6 video silently never got picked up for classification — no error, just
-   permanently missing data. Fixed: both now import the live ANALYSIS_PROMPT_VERSION constant.
-2. **Pseudo-replication in all 3 mining modules** (learn.mining, learn.copy_mining,
-   learn.replication) — none of them filtered external_performance_snapshots to each video's
-   LATEST row. Once scheduled polling started re-polling existing videos (2-3 snapshot rows per
-   video), every statistical test counted the same video 2-3x as independent observations,
-   artificially shrinking every p-value. A real run before the fix showed 22/49 "significant"
-   findings; after the fix, 7/46 on the identical dataset — the former was mostly this bug.
-   Fixed: all 3 modules now join against only each video's latest snapshot by timestamp.
+## Two mining pipelines now live, both automated, both feeding insights_external
+1. **Declared-taxonomy (Phase A, built last session)** — `learn.run_mining_pass`. Tests every
+   hardcoded mineable DNA column + 22 copy-technique flags. 7-8 live `proposed` findings,
+   source='internal_mining'. Human decided the categories upfront; bounded but interpretable.
+2. **Emergent clustering (Phase B, built THIS session)** — `learn.run_cluster_pass`. HDBSCAN
+   groups transcript embeddings with NO human-named categories; a cheap Claude call auto-labels
+   each statistically significant cluster afterward. 3 live `proposed` findings,
+   source='transcript_clustering'. Currently finds (all tier=proposed, correlational):
+   - "Live-shopping event announcements with urgency and deal highlights" OUTPERFORMS 5.16x vs
+     0.96x baseline (p=0.0007, n=8) — strongest signal in the whole dataset, either pipeline.
+   - "Seasonal wellness prep with product integration storytelling" underperforms (p=0.033, n=12)
+   - "Relatable humor about perimenopause symptom struggles" underperforms (p=0.004, n=6)
+   Real structural insight the declared-taxonomy approach could never have found (no one had
+   "live-shopping announcement" as a pre-defined category) — this is Phase B doing its real job.
 
-## Current real insights_external findings (tier=proposed, n=95, all source=internal_mining)
-1. format_tag='talking_head' outperforms (1.35x vs 0.94x baseline, p=0.0036)
-2. copy technique hook_promise_without_mechanism outperforms (p=0.0069)
-3. format_tag='voiceover_broll' underperforms (0.73x vs baseline, p=0.0109)
-4. copy technique hook_pain_callout underperforms (p=0.0112)
-5. caption_style='none' underperforms (0.33x vs baseline, p=0.0195)
-6. copy technique creates_urgency outperforms (1.91x, p=0.0440)
-7. hook_type='question' outperforms (1.63x, p=0.0490)
-All proposed-tier, n=95, correlational not causal — low confidence by design until owned
-evidence (Part 5c/experiments loop) tests them against OUR OWN account, which requires
-publishing owned content first (still zero published).
+## Real bugs found and fixed this session (3, all via live verification against real data)
+1. **uuid/text type mismatch** in run_cluster_pass's SQL — Python string item_ids vs native uuid
+   column, needed explicit `::uuid[]` casts. Mocked tests never caught it (mocks never touch real
+   SQL) — only surfaced running against the real DB.
+2. **Misleading "25 failed" in embedding stage** — videos with genuinely no transcript (expected,
+   not an error) were counted identically to real crashes. Added skipped_no_transcript as a
+   distinct counter.
+3. **THE SERIOUS ONE: clustering insights never actually persisted correctly.**
+   `retire_stale_external_insights`'s identity-matching silently skipped rows with no 'identity'
+   key (exactly clustering's shape — clusters have no stable identity across runs). Added
+   retire_all=True to bypass that. BUT the retire call was placed AFTER the propose loop in the
+   same pass, so every pass retired its own just-created findings seconds later — real DB showed
+   0 live proposed clustering insights after every single cycle despite "proposed: 3" being
+   reported. Fixed by reordering to retire-then-propose. Verified live twice in a row: stable at
+   exactly 3 proposed findings, no accumulation, no self-deletion.
 
 ## What's actually NOT done yet (don't assume otherwise)
-- No owned content has ever been published (5 draft IG statics sit unpublished in
-  data/assets/) — insights_owned / real performance-based learning can't start until that
-  manual publish step happens. The 7 insights_external findings above are external-only,
-  capped at lower trust by design until tested against owned data.
-- Part 5c (playbook authoring from accepted-tier insights) not started — nothing is
-  accepted-tier yet, nothing has graduated past proposed.
-- Instagram scraping account decision (Part 3) — still unresolved, untouched for weeks.
-- Separate test DB — tests still write into the real dev Postgres (flagged repeatedly,
-  not yet fixed). This session specifically found a real leaked test row in production data
-  from this exact gap — worth prioritizing before it recurs.
+- Multiple-comparison correction (Benjamini-Hochberg or similar) — NOT built. Both pipelines
+  together now run ~50+ tests per cycle; flat p<0.05 with no correction means some "significant"
+  findings in insights_external are near-certainly false positives from pure test volume. This
+  is the real next statistical-rigor gap, explicitly flagged in conversation but not yet built.
+- Cross-account/cross-niche replication auto-check (learn.replication.check_segment_replication,
+  already built and tested) is NOT wired into either automated pipeline — findings aren't
+  currently required to hold independently across both accounts before being proposed.
+- No owned content published — insights_owned pipeline (seed_owned_insight/record_owned_evidence,
+  built, tested, idle) has nothing real to validate against yet.
+- Instagram account-risk decision (Part 3) — still unresolved, untouched for weeks.
+- Separate test DB — this session hit a SECOND real leaked-test-fixture-in-production incident
+  (test_orch_* watched_account, active=True, polled on a real scheduled cycle) from this same
+  known gap. Flagged again, still not fixed, now with two real incidents as evidence it matters.
 
 ## Immediate next action (pick one)
-1. Let the automated pipeline run for a while (days) and watch the 7 insights stabilize or
-   shift as more data comes in via scheduled polling — nothing urgent to build, just observe.
-2. Publish one of the 5 draft IG statics to start the insights_owned / real validation loop —
-   the actual mechanism (learn.validation.seed_owned_insight / record_owned_evidence) is already
-   built and tested, just waiting on real owned performance data to mean anything.
-3. Finally build the separate test DB (Part 1 tech debt) — this session's leaked-fixture-in-
-   production incident is a concrete argument for prioritizing it now rather than later.
+1. Build multiple-comparison correction — the real statistical-rigor gap now that both pipelines
+   run automatically and the combined test count is large enough to matter.
+2. Wire learn.replication's cross-account check into both pipelines so a proposed finding must
+   hold independently in both accounts (not just pooled) before being surfaced — directly
+   addresses "is this real or one account's luck" with only 2 accounts currently watched.
+3. Let both pipelines run for a while (days/weeks) and watch which findings stay significant vs.
+   get retired as more data comes in — the clustering pipeline's own retire mechanism now
+   correctly reflects this in real time.
+4. Publish one of the 5 draft IG statics to finally start the insights_owned validation loop.
