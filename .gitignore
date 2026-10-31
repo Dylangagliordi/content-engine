@@ -7,3 +7,4 @@ data/assets/
 data/eval_logs/
 data/raw_videos/
 logs/
+data/ingestion_progress.log
