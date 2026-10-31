@@ -29,6 +29,7 @@ from qualume.learn.baseline import performance_vs_baseline
 MINEABLE_COLUMNS = frozenset({
     "hook_type", "format_tag", "cta_type", "caption_style",
     "tone_category", "voice_delivery_style", "pacing_qualitative",
+    "delivery_mode",
 })
 
 

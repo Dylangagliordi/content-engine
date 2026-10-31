@@ -283,7 +283,9 @@ def test_run_ingestion_cycle_isolates_one_annotation_failure_from_others(fake_ac
          patch("qualume.orchestrate.annotate_and_store") as mock_annotate, \
          patch("qualume.orchestrate.classify_and_store_external") as mock_classify, \
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
-         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls:
+         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
+         patch("qualume.orchestrate.run_mining_pass", return_value={}), \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
 
         mock_poll.return_value = {}
         mock_download.return_value = {}
@@ -309,7 +311,9 @@ def test_run_ingestion_cycle_isolates_one_classification_failure_from_others(fak
          patch("qualume.orchestrate.annotate_and_store") as mock_annotate, \
          patch("qualume.orchestrate.classify_and_store_external") as mock_classify, \
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
-         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls:
+         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
+         patch("qualume.orchestrate.run_mining_pass", return_value={}), \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
 
         mock_poll.return_value = {}
         mock_download.return_value = {}
@@ -338,7 +342,9 @@ def test_run_ingestion_cycle_continues_past_a_failed_poll_or_download_stage():
          patch("qualume.orchestrate.annotate_and_store") as mock_annotate, \
          patch("qualume.orchestrate.classify_and_store_external") as mock_classify, \
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
-         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls:
+         patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
+         patch("qualume.orchestrate.run_mining_pass", return_value={}), \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
 
         mock_poll.side_effect = RuntimeError("simulated poll failure")
         mock_download.return_value = {"downloaded": 0, "failed": 0, "already_had_path": 0}

@@ -26,6 +26,7 @@ before proposing fresh ones from this pass's real clusters — honest,
 since clusters really are re-discovered each run, not persistent named
 things with a continuous identity.
 """
+from qualume.learn.multiple_comparison import benjamini_hochberg
 from qualume.learn.transcript_clustering import cluster_transcripts
 from qualume.learn.transcript_embedding import embed_and_store
 from qualume.learn.validation import propose_external_insight, retire_stale_external_insights
@@ -192,12 +193,19 @@ def run_cluster_pass(applies_to_workflow_type: str) -> dict:
         return result
 
     proposed = 0
-    skipped_not_significant = 0
+    # BH correction (added 2026-10-30, same reasoning as learn.
+    # run_mining_pass): testable clusters (p_value not None — clusters
+    # below min_cluster_size already report None and are never part of
+    # this decision either way) are judged TOGETHER as one batch, not
+    # each against a flat threshold independently.
+    testable_clusters = [c for c in cluster_result["clusters"] if c["p_value"] is not None]
+    bh_significant = benjamini_hochberg(
+        [c["p_value"] for c in testable_clusters], fdr=SIGNIFICANCE_THRESHOLD
+    )
     significant_clusters = [
-        c for c in cluster_result["clusters"]
-        if c["p_value"] is not None and c["p_value"] < SIGNIFICANCE_THRESHOLD
+        c for c, is_sig in zip(testable_clusters, bh_significant) if is_sig
     ]
-    skipped_not_significant = len(cluster_result["clusters"]) - len(significant_clusters)
+    skipped_not_significant = len(testable_clusters) - len(significant_clusters)
 
     # RETIRE FIRST, then propose — real bug fixed 2026-10-30: retiring
     # AFTER the propose loop wiped out this exact pass's own fresh

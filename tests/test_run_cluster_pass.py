@@ -202,3 +202,41 @@ def test_run_cluster_pass_retires_before_proposing_not_after():
 
     assert call_order[0] == "retire"  # retire happens FIRST
     assert all(c == "propose" for c in call_order[1:])  # every propose after it
+
+
+def test_run_cluster_pass_applies_benjamini_hochberg_across_clusters():
+    """Same real correction as learn.run_mining_pass, applied here too for
+    consistency — a borderline p=0.04 cluster batched with several
+    near-random clusters must not survive BH correction even though it
+    would clear a flat p<0.05 on its own."""
+    import random
+    random.seed(55)
+    clusters = [
+        {
+            "cluster_id": i, "size": 8, "item_ids": [f"item-{i}-{j}" for j in range(8)],
+            "median_ratio_in_cluster": 1.1, "median_ratio_outside": 1.0,
+            "p_value": random.uniform(0.2, 0.9),
+        }
+        for i in range(6)
+    ]
+    clusters.append({
+        "cluster_id": 99, "size": 8, "item_ids": [f"item-99-{j}" for j in range(8)],
+        "median_ratio_in_cluster": 5.0, "median_ratio_outside": 1.0, "p_value": 0.04,
+    })
+    cluster_result = {"n_total": 70, "n_scored": 70, "n_noise": 10, "clusters": clusters}
+
+    with patch("qualume.learn.run_cluster_pass._find_pending_embedding", return_value=[]), \
+         patch("qualume.learn.run_cluster_pass.cluster_transcripts", return_value=cluster_result), \
+         patch("qualume.learn.run_cluster_pass._fetch_transcripts", return_value=["fake transcript"]), \
+         patch("qualume.learn.run_cluster_pass._fetch_niche_summary", return_value=set()), \
+         patch("qualume.learn.run_cluster_pass.pick_llm", return_value=MagicMock()), \
+         patch("qualume.learn.run_cluster_pass.propose_external_insight") as mock_propose, \
+         patch("qualume.learn.run_cluster_pass.retire_stale_external_insights", return_value=0):
+
+        result = run_cluster_pass(applies_to_workflow_type="tiktok_reels")
+
+    # BH's corrected threshold for rank 1 of 7 tests at FDR=0.05 is
+    # (1/7)*0.05 ≈ 0.0071, far below 0.04 — the borderline cluster must
+    # be rejected even though a flat p<0.05 would have let it through.
+    mock_propose.assert_not_called()
+    assert result["clustering"]["proposed"] == 0
