@@ -23,6 +23,23 @@ from qualume.learn.run_cluster_pass import run_cluster_pass
 from qualume.learn.run_mining_pass import run_mining_pass
 from qualume.poll_tiktok_watchlist import run_poll_cycle
 
+# Real concurrency (added 2026-10-30, per user's explicit request to reach
+# real volume "as fast as possible" after the watchlist grew from 2 to 20+
+# accounts): Gemini annotation and Claude classification are each a single
+# I/O-bound network call per video with no TikTok-facing rate-limit risk —
+# safe to run many at once. Deliberately moderate, not maximal: Gemini/
+# Claude both have their own real per-minute rate limits (same real-world
+# throttling concern as Voyage's own tier system hit earlier this project),
+# and 8 concurrent workers already turns a ~1 video/min serial bottleneck
+# into roughly an 8x speedup without risking a provider-side 429 storm.
+# poll/download are deliberately left fully sequential (default max_workers
+# =1, not raised) — those hit TikTok's own servers via yt-dlp directly,
+# where aggressive parallelism risks real IP rate-limiting/soft-blocking,
+# a materially different and more dangerous risk than hitting Gemini/
+# Claude harder.
+ANNOTATION_CONCURRENCY = 8
+CLASSIFICATION_CONCURRENCY = 8
+
 
 def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
     """external_content_items with a local video file but no row at the
@@ -88,15 +105,44 @@ def find_pending_classification(watched_account_id: str | None = None) -> list[s
         conn.close()
 
 
-def _run_stage_over_items(items: list[str], fn) -> dict:
+def _run_stage_over_items(items: list[str], fn, max_workers: int = 1) -> dict:
+    """Run fn(item_id) for every item, isolating one item's failure from
+    the rest. max_workers=1 (default) is the original strictly-sequential
+    behavior — every existing caller keeps working unchanged.
+
+    max_workers>1 (added 2026-10-30, per user's explicit request to reach
+    real volume "as fast as possible"): runs items CONCURRENTLY via
+    ThreadPoolExecutor — appropriate ONLY for stages whose real work is
+    an I/O-bound network call with no TikTok-facing rate-limit concern
+    (Gemini annotation, Claude classification). Deliberately NOT used for
+    poll/download in run_ingestion_cycle below — those hit TikTok's own
+    servers directly via yt-dlp, and parallelizing them risks real IP
+    rate-limiting/soft-blocking, a materially different risk than
+    parallelizing calls to Gemini/Claude's APIs."""
     succeeded = 0
     errors: list[tuple[str, str]] = []
-    for item_id in items:
-        try:
-            fn(item_id)
-            succeeded += 1
-        except Exception as e:
-            errors.append((item_id, f"{type(e).__name__}: {e}"))
+
+    if max_workers <= 1:
+        for item_id in items:
+            try:
+                fn(item_id)
+                succeeded += 1
+            except Exception as e:
+                errors.append((item_id, f"{type(e).__name__}: {e}"))
+        return {"succeeded": succeeded, "failed": len(errors), "errors": errors}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {executor.submit(fn, item_id): item_id for item_id in items}
+        for future in as_completed(future_to_item):
+            item_id = future_to_item[future]
+            try:
+                future.result()
+                succeeded += 1
+            except Exception as e:
+                errors.append((item_id, f"{type(e).__name__}: {e}"))
+
     return {"succeeded": succeeded, "failed": len(errors), "errors": errors}
 
 
@@ -133,14 +179,16 @@ def run_ingestion_cycle() -> dict:
 
     try:
         pending_annotation = find_pending_annotation()
-        result["annotation"] = _run_stage_over_items(pending_annotation, annotate_and_store)
+        result["annotation"] = _run_stage_over_items(
+            pending_annotation, annotate_and_store, max_workers=ANNOTATION_CONCURRENCY
+        )
     except Exception as e:
         result["annotation"] = {"error": f"{type(e).__name__}: {e}"}
 
     try:
         pending_classification = find_pending_classification()
         result["classification"] = _run_stage_over_items(
-            pending_classification, classify_and_store_external
+            pending_classification, classify_and_store_external, max_workers=CLASSIFICATION_CONCURRENCY
         )
     except Exception as e:
         result["classification"] = {"error": f"{type(e).__name__}: {e}"}
