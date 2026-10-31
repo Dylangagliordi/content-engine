@@ -14,6 +14,7 @@ structured shot fields (shot_type, setting, lighting, color_temperature
 the honest visual-equivalent signal to label from.
 """
 from unittest.mock import MagicMock, patch
+import time
 
 import pytest
 
@@ -84,6 +85,32 @@ def test_run_visual_cluster_pass_reports_no_video_items_separately_from_real_fai
     assert result["embedding"]["succeeded"] == 0
     assert result["embedding"]["failed"] == 1
     assert result["embedding"]["skipped_no_video"] == 1
+
+
+def test_run_visual_cluster_pass_embeds_pending_videos_concurrently():
+    """Real cost/throughput finding this session (2026-10-31): a single
+    visual embed (frame extraction + Voyage multimodal_embed call) takes
+    ~22s end to end, serial — 502 already-annotated videos alone would
+    take ~3 hours, the full 8857-video backlog ~54 hours. Embedding is an
+    I/O-bound network call with no TikTok-facing rate-limit risk (same
+    reasoning as orchestrate.py's ANNOTATION_CONCURRENCY/
+    CLASSIFICATION_CONCURRENCY) — safe, and necessary, to run
+    concurrently. This test proves real parallelism, not just an
+    accepted no-op parameter: 5 items that each take 0.2s should finish
+    in well under 5*0.2=1.0s with concurrency actually happening."""
+    def slow_embed(item_id):
+        time.sleep(0.2)
+
+    with patch("qualume.learn.run_visual_cluster_pass._find_pending_visual_embedding",
+               return_value=[f"item-{i}" for i in range(5)]), \
+         patch("qualume.learn.run_visual_cluster_pass.embed_and_store", side_effect=slow_embed), \
+         patch("qualume.learn.run_visual_cluster_pass.cluster_visual", side_effect=ValueError("below floor")):
+
+        start = time.monotonic()
+        run_visual_cluster_pass(applies_to_workflow_type="tiktok_reels")
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 0.6  # well under the ~1.0s+ sequential would take
 
 
 def test_run_visual_cluster_pass_skips_clustering_below_sample_floor():

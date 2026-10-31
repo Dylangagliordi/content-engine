@@ -20,6 +20,16 @@ from qualume.llm.pick_llm import pick_llm
 
 SIGNIFICANCE_THRESHOLD = 0.05
 
+# Real throughput finding this session (2026-10-31): a single visual
+# embed (frame extraction + Voyage multimodal_embed call) takes ~22s end
+# to end run serially — the real 8857-video backlog would take ~54 hours
+# at that rate. Embedding is an I/O-bound network call with no
+# TikTok-facing rate-limit risk, same reasoning as orchestrate.py's
+# ANNOTATION_CONCURRENCY/CLASSIFICATION_CONCURRENCY — safe to run many
+# at once. 8 workers matches those same constants' real-world-proven
+# balance between real speedup and provider-side 429 risk.
+EMBEDDING_CONCURRENCY = 8
+
 LABEL_PROMPT = """\
 You are looking at {n} TikTok video shot descriptions that a clustering \
 algorithm grouped together because their VISUAL structure (shot types, \
@@ -151,18 +161,23 @@ def run_visual_cluster_pass(applies_to_workflow_type: str) -> dict:
     clustering: {...}}."""
     pending = _find_pending_visual_embedding()
     embed_succeeded, embed_failed, embed_skipped_no_video = 0, 0, 0
-    for item_id in pending:
-        try:
-            embed_and_store(item_id)
-            embed_succeeded += 1
-        except ValueError:
-            # embed_and_store's own precondition failure (no
-            # local_video_path or no external_creative_dna row yet) — a
-            # real, expected shape, NOT a failure, same honesty
-            # discipline as run_cluster_pass's skipped_no_transcript.
-            embed_skipped_no_video += 1
-        except Exception:
-            embed_failed += 1
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as executor:
+        future_to_item = {executor.submit(embed_and_store, item_id): item_id for item_id in pending}
+        for future in as_completed(future_to_item):
+            try:
+                future.result()
+                embed_succeeded += 1
+            except ValueError:
+                # embed_and_store's own precondition failure (no
+                # local_video_path or no external_creative_dna row yet) — a
+                # real, expected shape, NOT a failure, same honesty
+                # discipline as run_cluster_pass's skipped_no_transcript.
+                embed_skipped_no_video += 1
+            except Exception:
+                embed_failed += 1
 
     result = {"embedding": {
         "succeeded": embed_succeeded, "failed": embed_failed,
