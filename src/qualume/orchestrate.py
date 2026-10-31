@@ -21,6 +21,7 @@ from qualume.annotate.gemini_watcher import annotate_and_store
 from qualume.ingest.tiktok_reader import download_pending_videos
 from qualume.learn.run_cluster_pass import run_cluster_pass
 from qualume.learn.run_mining_pass import run_mining_pass
+from qualume.learn.run_visual_cluster_pass import run_visual_cluster_pass
 from qualume.poll_tiktok_watchlist import run_poll_cycle
 
 # Real concurrency (added 2026-10-30, per user's explicit request to reach
@@ -212,5 +213,18 @@ def run_ingestion_cycle() -> dict:
         result["clustering"] = run_cluster_pass(applies_to_workflow_type="tiktok_reels")
     except Exception as e:
         result["clustering"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # Visual clustering — 7th stage, added 2026-10-31 per user's
+        # explicit request ("we need to use direct video embedding too
+        # along with our transcript embedding"). Kept as a SEPARATE
+        # stage/pass from the transcript clustering above, not fused —
+        # the user explicitly wants to compare real cluster quality from
+        # each side independently before any fusion decision. A Voyage
+        # multimodal outage or frame-extraction failure here must not
+        # block transcript clustering or mining, and vice versa.
+        result["visual_clustering"] = run_visual_cluster_pass(applies_to_workflow_type="tiktok_reels")
+    except Exception as e:
+        result["visual_clustering"] = {"error": f"{type(e).__name__}: {e}"}
 
     return result

@@ -190,7 +190,8 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
          patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
-         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster:
+         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
+         patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
 
         mock_poll.return_value = {"accounts_polled": 1, "new_videos": 2, "refreshed_snapshots": 0}
         mock_download.return_value = {"downloaded": 2, "failed": 0, "already_had_path": 0}
@@ -206,6 +207,10 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
             "embedding": {"succeeded": 3, "failed": 0},
             "clustering": {"n_total": 70, "proposed": 1, "retired": 0},
         }
+        mock_visual_cluster.return_value = {
+            "embedding": {"succeeded": 2, "failed": 0, "skipped_no_video": 0},
+            "clustering": {"n_total": 50, "proposed": 1, "retired": 0},
+        }
 
         result = run_ingestion_cycle()
 
@@ -219,6 +224,8 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
     mock_mining.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
     assert result["clustering"] == mock_cluster.return_value
     mock_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
+    assert result["visual_clustering"] == mock_visual_cluster.return_value
+    mock_visual_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
 
 
 def test_run_ingestion_cycle_isolates_a_whole_mining_stage_failure():
@@ -230,7 +237,8 @@ def test_run_ingestion_cycle_isolates_a_whole_mining_stage_failure():
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
          patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
-         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_poll.return_value = {}
         mock_download.return_value = {}
@@ -248,7 +256,8 @@ def test_run_ingestion_cycle_calls_cluster_pass_as_its_6th_stage():
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
-         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster:
+         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_cluster.return_value = {
             "embedding": {"succeeded": 3, "failed": 0},
@@ -267,7 +276,8 @@ def test_run_ingestion_cycle_isolates_a_whole_clustering_stage_failure():
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
-         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster:
+         patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_cluster.side_effect = RuntimeError("simulated Voyage outage")
 
@@ -275,6 +285,43 @@ def test_run_ingestion_cycle_isolates_a_whole_clustering_stage_failure():
 
     assert result["clustering"]["error"] is not None
     assert "simulated Voyage outage" in result["clustering"]["error"]
+
+
+def test_run_ingestion_cycle_calls_visual_cluster_pass_as_its_7th_stage():
+    with patch("qualume.orchestrate.run_poll_cycle", return_value={}), \
+         patch("qualume.orchestrate.download_pending_videos", return_value={}), \
+         patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
+         patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.run_mining_pass", return_value={}), \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
+
+        mock_visual_cluster.return_value = {
+            "embedding": {"succeeded": 2, "failed": 0, "skipped_no_video": 0},
+            "clustering": {"n_total": 50, "proposed": 1, "retired": 0},
+        }
+
+        result = run_ingestion_cycle()
+
+    assert result["visual_clustering"] == mock_visual_cluster.return_value
+    mock_visual_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
+
+
+def test_run_ingestion_cycle_isolates_a_whole_visual_clustering_stage_failure():
+    with patch("qualume.orchestrate.run_poll_cycle", return_value={}), \
+         patch("qualume.orchestrate.download_pending_videos", return_value={}), \
+         patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
+         patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.run_mining_pass", return_value={}), \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
+
+        mock_visual_cluster.side_effect = RuntimeError("simulated Voyage multimodal outage")
+
+        result = run_ingestion_cycle()
+
+    assert result["visual_clustering"]["error"] is not None
+    assert "simulated Voyage multimodal outage" in result["visual_clustering"]["error"]
 
 
 def test_run_ingestion_cycle_isolates_one_annotation_failure_from_others(fake_account):
@@ -285,7 +332,8 @@ def test_run_ingestion_cycle_isolates_one_annotation_failure_from_others(fake_ac
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
-         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_poll.return_value = {}
         mock_download.return_value = {}
@@ -313,7 +361,8 @@ def test_run_ingestion_cycle_isolates_one_classification_failure_from_others(fak
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
-         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_poll.return_value = {}
         mock_download.return_value = {}
@@ -344,7 +393,8 @@ def test_run_ingestion_cycle_continues_past_a_failed_poll_or_download_stage():
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
-         patch("qualume.orchestrate.run_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
 
         mock_poll.side_effect = RuntimeError("simulated poll failure")
         mock_download.return_value = {"downloaded": 0, "failed": 0, "already_had_path": 0}
