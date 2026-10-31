@@ -1,75 +1,78 @@
-# Qualume — Session Handoff (2026-10-30, Phase B built)
+# Qualume — Session Handoff (2026-10-30, visual mining + BH correction)
 
 ## Start here next session
 Read this file first, not chat history. Detail docs referenced below have the full writeups.
 
 ## Project state (all verified live against real data, not assumed)
-- 282/282 tests passing. Git clean.
-- n8n (`qualume-n8n`, published/active) runs a real 6-stage pipeline every 6 hours via the
-  launchd-managed orchestration server (`~/Library/LaunchAgents/com.qualume.orchestration-
-  server.plist`, RunAtLoad+KeepAlive — survives logout/restart/crash, does NOT survive the
-  Mac sleeping/being off): poll -> download -> annotate -> classify -> mine (declared-taxonomy)
-  -> cluster (emergent/Phase B, new this session).
-- 95 external videos, all fully annotated/classified. 70 have real transcript text and are
-  embedded (Voyage voyage-3.5); 25 genuinely have no spoken copy (product-only/voiceover shots)
-  and are correctly excluded, not a bug.
-- `watched_accounts.niche` (new column) set for both real accounts: "women's health supplements".
-  Purely informational — attached to findings as a tag, never baked into clustering math, so this
-  stays portable to a different business's accounts later (explicit user decision this session).
+- 307/307 tests passing. Git clean.
+- n8n (6-stage cycle, launchd-managed server) runs every 6 hours: poll -> download -> annotate ->
+  classify -> mine (Phase A, declared taxonomy) -> cluster (Phase B, emergent/HDBSCAN).
+- 95 external videos, all fully processed. 70 have real transcripts and are embedded; 25
+  genuinely have no spoken copy (product-only/voiceover shots), correctly excluded.
+- on_screen_text accuracy VERIFIED this session: extracted real video frames via ffmpeg, ran
+  independent tesseract OCR against 4 frames from 2 videos, confirmed matches against stored
+  text (3/4 clean, 1/4 fragment-level due to busy background) — the data is trustworthy, not
+  fabricated.
 
-## Two mining pipelines now live, both automated, both feeding insights_external
-1. **Declared-taxonomy (Phase A, built last session)** — `learn.run_mining_pass`. Tests every
-   hardcoded mineable DNA column + 22 copy-technique flags. 7-8 live `proposed` findings,
-   source='internal_mining'. Human decided the categories upfront; bounded but interpretable.
-2. **Emergent clustering (Phase B, built THIS session)** — `learn.run_cluster_pass`. HDBSCAN
-   groups transcript embeddings with NO human-named categories; a cheap Claude call auto-labels
-   each statistically significant cluster afterward. 3 live `proposed` findings,
-   source='transcript_clustering'. Currently finds (all tier=proposed, correlational):
-   - "Live-shopping event announcements with urgency and deal highlights" OUTPERFORMS 5.16x vs
-     0.96x baseline (p=0.0007, n=8) — strongest signal in the whole dataset, either pipeline.
-   - "Seasonal wellness prep with product integration storytelling" underperforms (p=0.033, n=12)
-   - "Relatable humor about perimenopause symptom struggles" underperforms (p=0.004, n=6)
-   Real structural insight the declared-taxonomy approach could never have found (no one had
-   "live-shopping announcement" as a pre-defined category) — this is Phase B doing its real job.
+## Real gap closed: visual/presenter data now mined (was captured, never tested before today)
+New `learn/array_mining.py` handles two shapes the existing mining modules didn't cover:
+- `mine_array_value` — JSONB array columns (music_mood_v2, script_structure_tags), no hardcoded
+  taxonomy, real distinct values auto-discovered from data
+- `mine_nested_field_value` — JSONB array-of-objects with a nested field (presenters[].
+  relatable_archetype / apparent_age_range / apparent_gender_presentation / delivery_affect)
+Wired into `run_mining_pass` as 2 new loops. Added `delivery_mode` to the existing flat-column
+mineable list too (quick win, was just never added).
 
-## Real bugs found and fixed this session (3, all via live verification against real data)
-1. **uuid/text type mismatch** in run_cluster_pass's SQL — Python string item_ids vs native uuid
-   column, needed explicit `::uuid[]` casts. Mocked tests never caught it (mocks never touch real
-   SQL) — only surfaced running against the real DB.
-2. **Misleading "25 failed" in embedding stage** — videos with genuinely no transcript (expected,
-   not an error) were counted identically to real crashes. Added skipped_no_transcript as a
-   distinct counter.
-3. **THE SERIOUS ONE: clustering insights never actually persisted correctly.**
-   `retire_stale_external_insights`'s identity-matching silently skipped rows with no 'identity'
-   key (exactly clustering's shape — clusters have no stable identity across runs). Added
-   retire_all=True to bypass that. BUT the retire call was placed AFTER the propose loop in the
-   same pass, so every pass retired its own just-created findings seconds later — real DB showed
-   0 live proposed clustering insights after every single cycle despite "proposed: 3" being
-   reported. Fixed by reordering to retire-then-propose. Verified live twice in a row: stable at
-   exactly 3 proposed findings, no accumulation, no self-deletion.
+## Real gap closed: multiple-comparison correction (Benjamini-Hochberg)
+New `learn/multiple_comparison.py` — textbook BH procedure (hand-verified worked example in
+tests). Wired into BOTH `run_mining_pass` (restructured to collect all p-values first, THEN
+decide significance as one batch) and `run_cluster_pass`.
+
+**Real, honest result from running this against actual data**: the mining pass now tests 72
+features/cycle (up from 46 before this session's visual-field wiring). Under BH correction,
+**0/72 survive** — versus 10/72 under the old flat p<0.05 (including what had looked like the
+strongest signal in the whole dataset, presenters.delivery_affect='excitedly sharing' at 3.68x).
+This means the old mining "findings" were very likely mostly noise amplified by running that many
+simultaneous tests against only 95 videos, not real signal. **User explicitly chose to keep BH as
+the new standard** rather than relax it — 0 honest findings beats false confidence. All 10 old
+proposed mining insights are now correctly tier='retired' in the DB.
+
+Clustering pass is far less affected by this (only ~7 tests/cycle, not 72) — still 3/7 survive,
+unchanged: "live-shopping event announcements" (5.16x), two underperforming clusters.
+
+## Real bugs found and fixed this session (beyond the two features above)
+- 3 pre-existing orchestrate tests were missing mocks for run_mining_pass/run_cluster_pass
+  (gap dating to when those stages were added LAST session) — once those stages started doing
+  real work this session, the tests started hanging 10+ minutes each on live DB/Voyage calls
+  instead of running as fast mocked units. Fixed, confirmed <4s now.
+- Same unmocked-module-constant pattern hit 5 pre-existing run_mining_pass tests the moment the
+  new array/nested loops went live (missing MINEABLE_ARRAY_COLUMNS/MINEABLE_NESTED_FIELDS mocks).
+- 2 more leaked test-fixture accounts found in the real watchlist mid-session (4th real incident
+  of this exact gap across sessions — no separate test DB remains the single most recurring real
+  problem this project has hit).
 
 ## What's actually NOT done yet (don't assume otherwise)
-- Multiple-comparison correction (Benjamini-Hochberg or similar) — NOT built. Both pipelines
-  together now run ~50+ tests per cycle; flat p<0.05 with no correction means some "significant"
-  findings in insights_external are near-certainly false positives from pure test volume. This
-  is the real next statistical-rigor gap, explicitly flagged in conversation but not yet built.
+- With 0 mining findings currently live, there is nothing from the declared-taxonomy pipeline to
+  act on right now — that's correct and honest, not broken. Needs more real data volume (more
+  videos, more accounts) before it can produce statistically trustworthy findings again.
 - Cross-account/cross-niche replication auto-check (learn.replication.check_segment_replication,
-  already built and tested) is NOT wired into either automated pipeline — findings aren't
-  currently required to hold independently across both accounts before being proposed.
-- No owned content published — insights_owned pipeline (seed_owned_insight/record_owned_evidence,
-  built, tested, idle) has nothing real to validate against yet.
+  built, tested) still not wired into either automated pipeline.
+- No owned content published — insights_owned pipeline (seed_owned_insight/record_owned_evidence)
+  has nothing real to validate against yet.
+- shot_breakdown's rich per-shot data (camera movement, lighting, colors, setting changes) is
+  STILL not mined directly — only the derived continuous features in learn/features.py exist
+  (built for the prediction.py random forest, not wired into mining as correlational tests yet).
+  Real next visual-data gap if more signal is wanted from that layer.
 - Instagram account-risk decision (Part 3) — still unresolved, untouched for weeks.
-- Separate test DB — this session hit a SECOND real leaked-test-fixture-in-production incident
-  (test_orch_* watched_account, active=True, polled on a real scheduled cycle) from this same
-  known gap. Flagged again, still not fixed, now with two real incidents as evidence it matters.
 
 ## Immediate next action (pick one)
-1. Build multiple-comparison correction — the real statistical-rigor gap now that both pipelines
-   run automatically and the combined test count is large enough to matter.
-2. Wire learn.replication's cross-account check into both pipelines so a proposed finding must
-   hold independently in both accounts (not just pooled) before being surfaced — directly
-   addresses "is this real or one account's luck" with only 2 accounts currently watched.
-3. Let both pipelines run for a while (days/weeks) and watch which findings stay significant vs.
-   get retired as more data comes in — the clustering pipeline's own retire mechanism now
-   correctly reflects this in real time.
-4. Publish one of the 5 draft IG statics to finally start the insights_owned validation loop.
+1. Let the pipeline run for real weeks/months — more data volume is the actual fix for "0 findings
+   survive BH correction right now"; nothing to build, just time + continued automated polling.
+2. Wire shot_breakdown's continuous features (cuts_per_min, avg_shot_length, color_temperature_
+   consistency, etc. — already computed in learn/features.py) into a numeric-correlation mining
+   pass (needs Spearman/Pearson correlation, not the Mann-Whitney group-comparison tests used
+   everywhere else — a genuinely different statistical test, not built yet).
+3. Wire learn.replication's cross-account check into both pipelines as an additional filter.
+4. Finally build the separate test DB (Part 1 tech debt) —4 real incidents now, the strongest
+   case yet for prioritizing this over any single new feature.
+5. Publish one of the 5 draft IG statics to finally start the insights_owned validation loop.
