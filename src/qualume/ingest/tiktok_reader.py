@@ -18,7 +18,13 @@ import yt_dlp
 
 from qualume.db.connection import get_connection
 
-DEFAULT_MAX_VIDEOS_PER_ACCOUNT = 30
+# Raised 2026-10-30 from 30, per user's explicit request to reach 5000
+# total ingested videos "as fast as possible" across many more accounts.
+# 30 x ~115 accounts tops out around 3450, short of the 5000 goal; 100
+# gives real headroom. Still bounded (not unlimited) and poll/download
+# remain strictly sequential (see orchestrate.py) to limit TikTok-facing
+# request volume per cycle despite the higher per-account ceiling.
+DEFAULT_MAX_VIDEOS_PER_ACCOUNT = 100
 DEFAULT_RAW_VIDEO_DIR = "data/raw_videos"
 
 # yt-dlp's in-progress / bookkeeping suffixes — a file with one of these is
