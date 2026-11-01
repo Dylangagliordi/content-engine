@@ -21,14 +21,19 @@ from qualume.llm.pick_llm import pick_llm
 SIGNIFICANCE_THRESHOLD = 0.05
 
 # Real throughput finding this session (2026-10-31): a single visual
-# embed (frame extraction + Voyage multimodal_embed call) takes ~22s end
+# embed (frame extraction + Voyage multimodal_embed call) took ~22s end
 # to end run serially — the real 8857-video backlog would take ~54 hours
 # at that rate. Embedding is an I/O-bound network call with no
 # TikTok-facing rate-limit risk, same reasoning as orchestrate.py's
 # ANNOTATION_CONCURRENCY/CLASSIFICATION_CONCURRENCY — safe to run many
-# at once. 8 workers matches those same constants' real-world-proven
-# balance between real speedup and provider-side 429 risk.
-EMBEDDING_CONCURRENCY = 8
+# at once.
+#
+# LOWERED from 8 to 4 same day, same reasoning as orchestrate.py's own
+# 8->4 reduction: running this pipeline's 8 ffmpeg-subprocess workers
+# alongside annotation/classification's own 8+8 workers drove physical
+# memory down to ~111MB free and caused a real OrbStack/Docker VM hang
+# (Postgres connection timeouts, required a full restart to recover).
+EMBEDDING_CONCURRENCY = 4
 
 LABEL_PROMPT = """\
 You are looking at {n} TikTok video shot descriptions that a clustering \

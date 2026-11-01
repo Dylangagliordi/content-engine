@@ -28,18 +28,21 @@ from qualume.poll_tiktok_watchlist import run_poll_cycle
 # real volume "as fast as possible" after the watchlist grew from 2 to 20+
 # accounts): Gemini annotation and Claude classification are each a single
 # I/O-bound network call per video with no TikTok-facing rate-limit risk —
-# safe to run many at once. Deliberately moderate, not maximal: Gemini/
-# Claude both have their own real per-minute rate limits (same real-world
-# throttling concern as Voyage's own tier system hit earlier this project),
-# and 8 concurrent workers already turns a ~1 video/min serial bottleneck
-# into roughly an 8x speedup without risking a provider-side 429 storm.
-# poll/download are deliberately left fully sequential (default max_workers
-# =1, not raised) — those hit TikTok's own servers via yt-dlp directly,
-# where aggressive parallelism risks real IP rate-limiting/soft-blocking,
-# a materially different and more dangerous risk than hitting Gemini/
-# Claude harder.
-ANNOTATION_CONCURRENCY = 8
-CLASSIFICATION_CONCURRENCY = 8
+# safe to run many at once.
+#
+# LOWERED from 8 to 4 on 2026-10-31 after a real production incident: with
+# ANNOTATION_CONCURRENCY=8, CLASSIFICATION_CONCURRENCY=8, and visual
+# embedding's own EMBEDDING_CONCURRENCY=8 (ffmpeg subprocess per worker)
+# all running at once for hours, physical memory dropped to ~111MB free /
+# load avg 7.4, and OrbStack's Docker VM hung hard enough that Postgres
+# became genuinely unreachable (connection timeout, not just a slow
+# query) — required a full OrbStack restart to recover. 4 workers is a
+# real, deliberately conservative choice to leave headroom for the other
+# concurrent pipelines (visual embedding) sharing the same host, not a
+# guess — revisit upward only with real memory-pressure monitoring in
+# place, not just because throughput feels slow.
+ANNOTATION_CONCURRENCY = 4
+CLASSIFICATION_CONCURRENCY = 4
 
 
 def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
