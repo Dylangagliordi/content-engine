@@ -96,3 +96,88 @@ def test_cluster_visual_skips_items_with_no_performance_data():
         result = cluster_visual(min_cluster_size=5)
 
     assert result["n_scored"] == len(fake_rows) - 1
+
+
+def test_cluster_visual_passes_niche_through_to_fetch_embeddings():
+    """Same real fix (2026-11-02) as transcript_clustering.
+    cluster_transcripts — the whole-watchlist niche-mixing problem
+    applies identically to the visual clustering pipeline."""
+    fake_rows = _fake_embeddings(MIN_SAMPLE_SIZE + 10)
+
+    with patch("qualume.learn.visual_clustering._fetch_embeddings", return_value=fake_rows) as mock_fetch, \
+         patch("qualume.learn.visual_clustering.performance_vs_baseline") as mock_perf:
+        mock_perf.return_value = {"ratio_to_median": 1.0}
+        cluster_visual(min_cluster_size=5, niche="zz_test_niche")
+
+    mock_fetch.assert_called_once_with(niche="zz_test_niche")
+
+
+def test_fetch_embeddings_scopes_to_one_niche_when_given():
+    """Real integration test against the actual dev DB (not mockable the
+    way the pure-math clustering logic is) — niche is inherited from
+    watched_accounts via external_content_items, not stored directly on
+    visual_embeddings, so this needs a real JOIN proven against real
+    rows."""
+    import json
+    import uuid
+
+    from qualume.db.connection import get_connection
+    from qualume.db.watchlist import add_watched_account
+    from qualume.learn.visual_clustering import _fetch_embeddings
+
+    target_handle = f"test_visual_niche_target_{uuid.uuid4().hex[:8]}"
+    other_handle = f"test_visual_niche_other_{uuid.uuid4().hex[:8]}"
+
+    def _cleanup(handle):
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM visual_embeddings WHERE external_content_item_id IN "
+                    "(SELECT id FROM external_content_items WHERE watched_account_id IN "
+                    "(SELECT id FROM watched_accounts WHERE handle = %s))", (handle,))
+                cur.execute(
+                    "DELETE FROM external_content_items WHERE watched_account_id IN "
+                    "(SELECT id FROM watched_accounts WHERE handle = %s)", (handle,))
+                cur.execute("DELETE FROM watched_accounts WHERE handle = %s", (handle,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _cleanup(target_handle)
+    _cleanup(other_handle)
+    try:
+        target_account = add_watched_account("tiktok", target_handle, niche="zz_test_visual_niche")
+        other_account = add_watched_account("tiktok", other_handle, niche="zz_test_visual_other")
+
+        target_item_ids, other_item_ids = [], []
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                for account_id, id_list in [(target_account, target_item_ids), (other_account, other_item_ids)]:
+                    cur.execute(
+                        """INSERT INTO external_content_items
+                           (watched_account_id, platform, platform_video_id, url)
+                           VALUES (%s, 'tiktok', %s, 'https://example.com/fake')
+                           RETURNING id""",
+                        (account_id, uuid.uuid4().hex),
+                    )
+                    item_id = cur.fetchone()[0]
+                    id_list.append(str(item_id))
+                    cur.execute(
+                        """INSERT INTO visual_embeddings
+                           (external_content_item_id, embedding, n_frames_used, embedding_model)
+                           VALUES (%s, %s, 6, 'test-model')""",
+                        (item_id, json.dumps([0.1, 0.2, 0.3])),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        scoped = _fetch_embeddings(niche="zz_test_visual_niche")
+        scoped_ids = {item_id for item_id, _ in scoped}
+        assert set(target_item_ids) <= scoped_ids
+        assert not (set(other_item_ids) & scoped_ids)
+    finally:
+        _cleanup(target_handle)
+        _cleanup(other_handle)

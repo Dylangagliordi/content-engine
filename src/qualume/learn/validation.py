@@ -38,6 +38,7 @@ def propose_external_insight(
     applies_to_workflow_type: str,
     applies_to_segment: dict | None = None,
     source: str = "internal_mining",
+    niche: str | None = None,
 ) -> str:
     """Insert a new insights_external row at tier='proposed' — the
     output shape of learn.mining/learn.replication's results, made
@@ -48,13 +49,26 @@ def propose_external_insight(
     pipeline's own tag) — learn.run_cluster_pass passes
     source='transcript_clustering' explicitly so its findings are
     distinguishable and so retire_stale_external_insights' source filter
-    can target exactly one pipeline's rows without touching the other's."""
+    can target exactly one pipeline's rows without touching the other's.
+
+    niche (added 2026-11-02, same real fix as upsert_external_insight):
+    when given, folded into applies_to_segment['niche'] so a later
+    niche-scoped retire_stale_external_insights call can find it. Kept
+    separate from the pre-existing applies_to_segment['niches'] list
+    (run_cluster_pass/run_visual_cluster_pass's own informational
+    multi-niche tag describing which real niches contributed to a
+    cluster) — this one is the single scalar niche a NICHE-SCOPED pass
+    was run for, not an observed set."""
     from qualume.db.connection import get_connection
     import json
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            segment_payload = {
+                **(applies_to_segment or {}),
+                **({"niche": niche} if niche is not None else {}),
+            }
             cur.execute(
                 """INSERT INTO insights_external
                    (statement, effect_size, sample_size, p_value,
@@ -62,7 +76,7 @@ def propose_external_insight(
                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (statement, effect_size, sample_size, p_value,
-                 applies_to_workflow_type, json.dumps(applies_to_segment or {}), source),
+                 applies_to_workflow_type, json.dumps(segment_payload), source),
             )
             insight_id = cur.fetchone()[0]
         conn.commit()
@@ -80,6 +94,7 @@ def upsert_external_insight(
     identity: dict,
     source: str = "internal_mining",
     supporting_data_refs: dict | None = None,
+    niche: str | None = None,
 ) -> str:
     """Create-or-refresh an insights_external row keyed on STABLE identity
     (applies_to_workflow_type + identity dict, e.g. {"mined_from":
@@ -91,8 +106,17 @@ def upsert_external_insight(
     stage) safe to run repeatedly without creating duplicate rows for the
     same underlying finding every single cycle.
 
+    niche (added 2026-11-02, real fix for a real problem): when the
+    watchlist's real accounts span unrelated niches, the SAME declared-
+    taxonomy identity (e.g. format_tag='talking_head' outperforms) found
+    independently in two different niches is genuinely two different
+    claims about two different audiences — niche is folded into the
+    match/upsert key alongside identity so they're tracked as separate
+    rows, not collapsed. Also stored in applies_to_segment.niche so
+    retire_stale_external_insights can scope retirement by niche too.
+
     Behavior:
-    - No existing row with this (workflow_type, identity, source) ->
+    - No existing row with this (workflow_type, identity, niche, source) ->
       INSERT new, tier='proposed', state_history=[{"event": "proposed", ...}].
     - Existing row found -> UPDATE statement/effect_size/sample_size/
       p_value/supporting_data_refs in place. An insight's CURRENT
@@ -117,17 +141,22 @@ def upsert_external_insight(
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, state_history FROM insights_external
-                   WHERE applies_to_workflow_type = %s
-                     AND source = %s
-                     AND applies_to_segment -> 'identity' = %s::jsonb""",
-                (applies_to_workflow_type, source, identity_json),
-            )
+            query = """SELECT id, state_history FROM insights_external
+                       WHERE applies_to_workflow_type = %s
+                         AND source = %s
+                         AND applies_to_segment -> 'identity' = %s::jsonb"""
+            params: list = [applies_to_workflow_type, source, identity_json]
+            if niche is not None:
+                query += " AND applies_to_segment ->> 'niche' = %s"
+                params.append(niche)
+            else:
+                query += " AND applies_to_segment ->> 'niche' IS NULL"
+            cur.execute(query, params)
             row = cur.fetchone()
 
             segment_payload = {
                 "identity": identity,
+                **({"niche": niche} if niche is not None else {}),
                 **(supporting_data_refs or {}),
             }
 
@@ -167,7 +196,7 @@ def upsert_external_insight(
 
 def retire_stale_external_insights(
     applies_to_workflow_type: str, still_significant_identities: list[dict],
-    source: str = "internal_mining", retire_all: bool = False,
+    source: str = "internal_mining", retire_all: bool = False, niche: str | None = None,
 ) -> int:
     """Any 'proposed'-tier, source-matching insights_external row for this
     workflow_type whose identity is NOT in still_significant_identities
@@ -191,6 +220,16 @@ def retire_stale_external_insights(
     though retire_stale_external_insights was being called every cycle
     with the clear intent "retire everything from last time".
 
+    niche (added 2026-11-02, real fix for a real problem): optionally
+    scopes retirement to only rows whose applies_to_segment.niche matches
+    this exact string. Needed once mining/clustering started running
+    PER-NICHE (the real fix for the watchlist-niche-mixing problem) — a
+    niche-scoped pass's own "still significant" list obviously only
+    covers ITS niche, so without this scope a women's-health pass's
+    retire call would wrongly retire a still-valid religion/philosophy
+    finding (and vice versa) just because that other niche's identities
+    never appear in this pass's own results.
+
     Returns the number of rows retired."""
     from qualume.db.connection import get_connection
     import json
@@ -202,11 +241,13 @@ def retire_stale_external_insights(
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, applies_to_segment, state_history FROM insights_external
-                   WHERE applies_to_workflow_type = %s AND source = %s AND tier = 'proposed'""",
-                (applies_to_workflow_type, source),
-            )
+            query = """SELECT id, applies_to_segment, state_history FROM insights_external
+                       WHERE applies_to_workflow_type = %s AND source = %s AND tier = 'proposed'"""
+            params: list = [applies_to_workflow_type, source]
+            if niche is not None:
+                query += " AND applies_to_segment ->> 'niche' = %s"
+                params.append(niche)
+            cur.execute(query, params)
             rows = cur.fetchall()
 
             retired = 0

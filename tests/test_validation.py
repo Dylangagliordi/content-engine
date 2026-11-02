@@ -325,6 +325,54 @@ def test_upsert_external_insight_never_overwrites_a_different_source(prefix):
     assert "manually curated claim" in statement  # untouched by the auto upsert
 
 
+def test_upsert_external_insight_stores_niche_in_segment_payload(prefix):
+    """Real fix (2026-11-02): niche must be queryable off a stored
+    insight row (retire_stale_external_insights' own niche filter reads
+    applies_to_segment ->> 'niche') — this proves upsert actually writes
+    it there when the caller passes one."""
+    insight_id = upsert_external_insight(
+        statement=f"{prefix}niche-scoped finding",
+        effect_size=0.5, sample_size=12, p_value=0.01,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_creative_dna.format_tag", "value": "talking_head"},
+        niche="zz_test_upsert_niche",
+    )
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT applies_to_segment ->> 'niche' FROM insights_external WHERE id = %s",
+                (insight_id,),
+            )
+            (stored_niche,) = cur.fetchone()
+    finally:
+        conn.close()
+    assert stored_niche == "zz_test_upsert_niche"
+
+
+def test_upsert_external_insight_same_identity_different_niche_creates_separate_rows(prefix):
+    """Real fix (2026-11-02): the SAME declared-taxonomy identity (e.g.
+    format_tag='talking_head' outperforms) found independently in TWO
+    different niches must be tracked as two SEPARATE insights, not
+    collapsed into one upsert-refreshed row — they're genuinely different
+    claims about different audiences, even if the identity dict matches."""
+    id_a = upsert_external_insight(
+        statement=f"{prefix}talking_head outperforms in niche A",
+        effect_size=0.5, sample_size=12, p_value=0.01,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_creative_dna.format_tag", "value": "talking_head"},
+        niche="zz_test_niche_sep_a",
+    )
+    id_b = upsert_external_insight(
+        statement=f"{prefix}talking_head outperforms in niche B",
+        effect_size=0.6, sample_size=20, p_value=0.02,
+        applies_to_workflow_type="tiktok_video",
+        identity={"mined_from": "external_creative_dna.format_tag", "value": "talking_head"},
+        niche="zz_test_niche_sep_b",
+    )
+    assert id_a != id_b
+
+
 def test_retire_stale_external_insights_retires_no_longer_significant_proposed_rows(prefix):
     identity_a = {"mined_from": "external_creative_dna.format_tag", "value": "voiceover_broll"}
     identity_b = {"mined_from": "external_copy_analysis.hook_pain_callout", "value": True}
@@ -465,3 +513,50 @@ def test_retire_stale_external_insights_retire_all_still_respects_accepted_tier(
         retire_all=True,
     )
     assert retired == 0
+
+
+def test_retire_stale_external_insights_scopes_to_one_niche_when_given(prefix):
+    """Real fix (2026-11-02): once mining runs PER-NICHE (the real fix
+    for the watchlist-niche-mixing problem), a niche-scoped pass's
+    retire call must only touch ITS OWN niche's rows — otherwise a
+    women's-health mining pass would wrongly retire a still-valid
+    religion/philosophy finding (and vice versa) just because the
+    women's-health pass's still_significant_identities list obviously
+    doesn't include any religion/philosophy identities."""
+    propose_external_insight(
+        statement=f"{prefix}niche A finding",
+        effect_size=0.5, sample_size=8, p_value=0.001,
+        applies_to_workflow_type="tiktok_video",
+        applies_to_segment={"niche": "zz_test_retire_niche_a"},
+        source="transcript_clustering",
+    )
+    propose_external_insight(
+        statement=f"{prefix}niche B finding",
+        effect_size=0.5, sample_size=8, p_value=0.001,
+        applies_to_workflow_type="tiktok_video",
+        applies_to_segment={"niche": "zz_test_retire_niche_b"},
+        source="transcript_clustering",
+    )
+
+    # A niche-A-scoped pass's retire_all must NOT touch niche B's row.
+    retired = retire_stale_external_insights(
+        applies_to_workflow_type="tiktok_video",
+        still_significant_identities=[],
+        source="transcript_clustering",
+        retire_all=True,
+        niche="zz_test_retire_niche_a",
+    )
+    assert retired == 1
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT statement, tier FROM insights_external WHERE statement LIKE %s ORDER BY statement",
+                (f"{prefix}%",),
+            )
+            rows = {r[0]: r[1] for r in cur.fetchall()}
+    finally:
+        conn.close()
+    assert rows[f"{prefix}niche A finding"] == "retired"
+    assert rows[f"{prefix}niche B finding"] == "proposed"  # untouched, different niche

@@ -154,13 +154,20 @@ def _label_cluster(item_ids: list[str]) -> str:
     return str(response.content).strip()
 
 
-def run_visual_cluster_pass(applies_to_workflow_type: str) -> dict:
+def run_visual_cluster_pass(applies_to_workflow_type: str, niche: str | None = None) -> dict:
     """Run one full visual clustering pass: embed pending videos'
     frames, cluster, label and propose significant findings, retire
     every previous visual-cluster-sourced proposal first (HDBSCAN
     cluster IDs have no stable identity across runs — identical real
     bug-fix discipline as run_cluster_pass: retire BEFORE propose, never
     after, or a pass retires its own fresh findings).
+
+    niche (added 2026-11-02, mirrors run_cluster_pass's own real fix):
+    when given, scopes cluster_visual itself to only this niche's
+    embeddings AND tags every proposed/retired insight with it, so a
+    niche-scoped pass's retirement only ever touches its own niche's
+    rows. Still None by default — unscoped, original cross-niche
+    behavior.
 
     Returns: {embedding: {succeeded, failed, skipped_no_video},
     clustering: {...}}."""
@@ -190,7 +197,7 @@ def run_visual_cluster_pass(applies_to_workflow_type: str) -> dict:
     }}
 
     try:
-        cluster_result = cluster_visual()
+        cluster_result = cluster_visual(niche=niche)
     except ValueError as e:
         result["clustering"] = {"skipped_reason": f"below sample floor: {e}"}
         return result
@@ -210,6 +217,7 @@ def run_visual_cluster_pass(applies_to_workflow_type: str) -> dict:
         still_significant_identities=[],
         source="visual_clustering",
         retire_all=True,
+        niche=niche,
     )
 
     for cluster in significant_clusters:
@@ -234,6 +242,7 @@ def run_visual_cluster_pass(applies_to_workflow_type: str) -> dict:
                 "label": label,
                 "niches": niches,
             },
+            niche=niche,
             source="visual_clustering",
         )
         proposed += 1

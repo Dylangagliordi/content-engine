@@ -20,22 +20,35 @@ MIN_SAMPLE_SIZE = 40  # same floor as transcript_clustering, same reasoning
 MIN_CLUSTER_SIZE_DEFAULT = 5  # same floor as transcript_clustering/mining.py
 
 
-def _fetch_embeddings() -> list[tuple[str, list[float]]]:
+def _fetch_embeddings(niche: str | None = None) -> list[tuple[str, list[float]]]:
     """All (external_content_item_id, embedding) pairs currently stored
     in visual_embeddings. Isolated into its own function so tests can
-    patch it directly rather than needing real embeddings in a test DB."""
+    patch it directly rather than needing real embeddings in a test DB.
+
+    niche (added 2026-11-02, same real fix as transcript_clustering's
+    own _fetch_embeddings): optionally scopes to only videos from
+    watched_accounts tagged with this exact niche string."""
     from qualume.db.connection import get_connection
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT external_content_item_id, embedding FROM visual_embeddings")
+            query = "SELECT external_content_item_id, embedding FROM visual_embeddings"
+            params: list = []
+            if niche is not None:
+                query += """ WHERE external_content_item_id IN (
+                    SELECT eci.id FROM external_content_items eci
+                    JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+                    WHERE wa.niche = %s
+                )"""
+                params.append(niche)
+            cur.execute(query, params)
             return [(str(item_id), embedding) for item_id, embedding in cur.fetchall()]
     finally:
         conn.close()
 
 
-def cluster_visual(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT) -> dict:
+def cluster_visual(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT, niche: str | None = None) -> dict:
     """Run HDBSCAN over every stored visual embedding, test each real
     cluster's performance-vs-account-baseline ratio against everything
     OUTSIDE that cluster — identical statistical shape to
@@ -49,7 +62,7 @@ def cluster_visual(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT) -> dict:
 
     Raises ValueError below MIN_SAMPLE_SIZE real embeddings.
     """
-    rows = _fetch_embeddings()
+    rows = _fetch_embeddings(niche=niche)
     if len(rows) < MIN_SAMPLE_SIZE:
         raise ValueError(
             f"cluster_visual needs at least {MIN_SAMPLE_SIZE} real embeddings, "

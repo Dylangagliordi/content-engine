@@ -107,12 +107,26 @@ def _nested_statement(column: str, field: str, result: dict) -> str:
     )
 
 
-def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> dict:
+def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5, niche: str | None = None) -> dict:
     """Run the full Part 5b statistical pass over every mineable field,
     apply Benjamini-Hochberg correction across the WHOLE batch of
     p-values together (not per-feature-type), upsert BH-significant
     findings into insights_external, retire whatever stopped being
     BH-significant since the last pass.
+
+    niche (added 2026-11-02, real fix for a real problem): optionally
+    scopes the ENTIRE pass — every mine_*/discover_* call, every proposed
+    insight's stored niche tag, and the final retire call — to only one
+    real niche string. Added once the real watchlist grew from 2 niche-
+    aligned accounts to 220 accounts spanning unrelated niches (women's
+    health, religion/philosophy, fitness, food, beauty...); pooling all
+    of them into one unscoped pass made every finding uninterpretable
+    (comparing a prenatal-vitamin video's performance against a Quran-
+    recitation video's has no real meaning). The real orchestrator
+    (orchestrate.run_ingestion_cycle) is expected to call this once PER
+    real niche present in watched_accounts, not once unscoped, going
+    forward — left optional (None = unscoped, original cross-niche
+    behavior) so existing callers/tests keep working unchanged.
 
     Two-pass shape, required by BH (it needs every p-value collected
     BEFORE any individual result can be judged significant — unlike a
@@ -133,7 +147,7 @@ def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> d
 
     for column in sorted(MINEABLE_COLUMNS):
         try:
-            results = mine_categorical_feature(column, min_group_size=min_group_size) or []
+            results = mine_categorical_feature(column, min_group_size=min_group_size, niche=niche) or []
         except Exception as e:
             errors.append(f"{column}: {type(e).__name__}: {e}")
             continue
@@ -154,7 +168,7 @@ def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> d
 
     for flag in sorted(MINEABLE_COPY_FLAGS):
         try:
-            result = mine_boolean_copy_feature(flag, min_group_size=min_group_size)
+            result = mine_boolean_copy_feature(flag, min_group_size=min_group_size, niche=niche)
         except Exception as e:
             errors.append(f"{flag}: {type(e).__name__}: {e}")
             continue
@@ -176,13 +190,13 @@ def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> d
 
     for column in sorted(MINEABLE_ARRAY_COLUMNS):
         try:
-            values = discover_array_values(column)
+            values = discover_array_values(column, niche=niche)
         except Exception as e:
             errors.append(f"{column}: {type(e).__name__}: {e}")
             continue
         for value in sorted(values):
             try:
-                result = mine_array_value(column, value, min_group_size=min_group_size)
+                result = mine_array_value(column, value, min_group_size=min_group_size, niche=niche)
             except Exception as e:
                 errors.append(f"{column}={value}: {type(e).__name__}: {e}")
                 continue
@@ -204,13 +218,13 @@ def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> d
 
     for column, field in sorted(MINEABLE_NESTED_FIELDS):
         try:
-            values = discover_nested_field_values(column, field)
+            values = discover_nested_field_values(column, field, niche=niche)
         except Exception as e:
             errors.append(f"{column}.{field}: {type(e).__name__}: {e}")
             continue
         for value in sorted(values):
             try:
-                result = mine_nested_field_value(column, field, value, min_group_size=min_group_size)
+                result = mine_nested_field_value(column, field, value, min_group_size=min_group_size, niche=niche)
             except Exception as e:
                 errors.append(f"{column}.{field}={value}: {type(e).__name__}: {e}")
                 continue
@@ -251,12 +265,14 @@ def run_mining_pass(applies_to_workflow_type: str, min_group_size: int = 5) -> d
             applies_to_workflow_type=applies_to_workflow_type,
             identity=candidate["identity"],
             supporting_data_refs=candidate["supporting_data_refs"],
+            niche=niche,
         )
         proposed_or_refreshed += 1
 
     retired = retire_stale_external_insights(
         applies_to_workflow_type=applies_to_workflow_type,
         still_significant_identities=still_significant_identities,
+        niche=niche,
     )
 
     return {

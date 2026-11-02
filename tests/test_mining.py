@@ -198,6 +198,54 @@ def test_mine_categorical_feature_counts_each_video_once_even_with_multiple_perf
     assert by_value["zz_test_repolled"]["n_with"] == 5
 
 
+def test_mine_categorical_feature_scopes_to_one_niche_when_given(fake_account):
+    """Real fix for a real problem (2026-11-02): the watchlist grew from
+    2 niche-aligned accounts to 220 accounts spanning unrelated niches
+    (women's health, religion/philosophy, fitness, food, beauty...).
+    Pooling all of them into one mining pass makes every finding
+    uninterpretable — 'hook_type=question outperforms' means nothing if
+    it's averaged across prenatal-vitamin TikToks and Quran-recitation
+    TikToks, which have no comparable notion of 'performs well'. niche
+    scopes the test to only videos from accounts tagged with that real
+    niche string (watched_accounts.niche), same optional-scoping pattern
+    mine_boolean_copy_feature's watched_account_id already uses."""
+    account_id, handle = fake_account
+    other_handle = f"test_mining_other_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    try:
+        from qualume.db.watchlist import add_watched_account
+        other_account_id = add_watched_account(
+            "tiktok", other_handle, niche="zz_test_other_niche"
+        )
+
+        # this account has no niche set in the fixture by default — set one
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE watched_accounts SET niche = %s WHERE id = %s",
+                            ("zz_test_target_niche", account_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        for views in [800, 900, 1000, 1100, 1200]:
+            _insert_video(account_id, views, "zz_test_scoped_high", energy_level=3)
+        for views in [50, 60, 70, 80, 90]:
+            _insert_video(account_id, views, "zz_test_scoped_low", energy_level=3)
+        # same hook values on the OTHER niche — must NOT count toward the
+        # scoped pass below
+        for views in [800, 900, 1000, 1100, 1200]:
+            _insert_video(other_account_id, views, "zz_test_scoped_high", energy_level=3)
+
+        results = mine_categorical_feature(
+            "hook_type", min_group_size=3, niche="zz_test_target_niche"
+        )
+        by_value = {r["value"]: r for r in results}
+        assert by_value["zz_test_scoped_high"]["n_with"] == 5  # only the target-niche account's 5, not 10
+    finally:
+        _cleanup_account(other_handle)
+
+
 def test_mine_categorical_feature_counts_each_video_once_even_with_multiple_annotation_versions(
         fake_account):
     """Regression test for a real bug found running this against the

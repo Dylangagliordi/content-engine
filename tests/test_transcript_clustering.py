@@ -136,3 +136,93 @@ def test_cluster_transcripts_skips_items_with_no_performance_data():
         result = cluster_transcripts(min_cluster_size=5)
 
     assert result["n_scored"] == len(fake_rows) - 1
+
+
+def test_cluster_transcripts_passes_niche_through_to_fetch_embeddings():
+    """cluster_transcripts itself must forward niche to _fetch_embeddings
+    — the caller (run_cluster_pass, once niche-scoped) shouldn't need to
+    know the internal fetch function's name to scope a clustering run."""
+    fake_rows = _fake_embeddings(MIN_SAMPLE_SIZE + 10)
+
+    with patch("qualume.learn.transcript_clustering._fetch_embeddings", return_value=fake_rows) as mock_fetch, \
+         patch("qualume.learn.transcript_clustering.performance_vs_baseline") as mock_perf:
+        mock_perf.return_value = {"ratio_to_median": 1.0}
+        cluster_transcripts(min_cluster_size=5, niche="zz_test_niche")
+
+    mock_fetch.assert_called_once_with(niche="zz_test_niche")
+
+
+def test_fetch_embeddings_scopes_to_one_niche_when_given():
+    """Real fix (2026-11-02): _fetch_embeddings pulled EVERY stored
+    transcript embedding with no niche awareness at all — the real
+    watchlist now spans completely unrelated niches (women's health,
+    religion/philosophy, fitness...), so clustering pooled them all into
+    one undifferentiated vector space. A video's niche is NOT a column on
+    transcript_embeddings itself — it's inherited from watched_accounts
+    via external_content_items, so this needs a real JOIN, tested against
+    the real dev DB (not mockable the way the pure-math clustering logic
+    is), same no-separate-test-DB discipline as every DB-touching test in
+    this project."""
+    import json
+    import uuid
+
+    from qualume.db.connection import get_connection
+    from qualume.db.watchlist import add_watched_account
+    from qualume.learn.transcript_clustering import _fetch_embeddings
+
+    target_handle = f"test_niche_fetch_target_{uuid.uuid4().hex[:8]}"
+    other_handle = f"test_niche_fetch_other_{uuid.uuid4().hex[:8]}"
+
+    def _cleanup(handle):
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM transcript_embeddings WHERE external_content_item_id IN "
+                    "(SELECT id FROM external_content_items WHERE watched_account_id IN "
+                    "(SELECT id FROM watched_accounts WHERE handle = %s))", (handle,))
+                cur.execute(
+                    "DELETE FROM external_content_items WHERE watched_account_id IN "
+                    "(SELECT id FROM watched_accounts WHERE handle = %s)", (handle,))
+                cur.execute("DELETE FROM watched_accounts WHERE handle = %s", (handle,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _cleanup(target_handle)
+    _cleanup(other_handle)
+    try:
+        target_account = add_watched_account("tiktok", target_handle, niche="zz_test_cluster_niche")
+        other_account = add_watched_account("tiktok", other_handle, niche="zz_test_cluster_other")
+
+        target_item_ids, other_item_ids = [], []
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                for account_id, id_list in [(target_account, target_item_ids), (other_account, other_item_ids)]:
+                    cur.execute(
+                        """INSERT INTO external_content_items
+                           (watched_account_id, platform, platform_video_id, url)
+                           VALUES (%s, 'tiktok', %s, 'https://example.com/fake')
+                           RETURNING id""",
+                        (account_id, uuid.uuid4().hex),
+                    )
+                    item_id = cur.fetchone()[0]
+                    id_list.append(str(item_id))
+                    cur.execute(
+                        """INSERT INTO transcript_embeddings
+                           (external_content_item_id, embedding, source_text_hash, embedding_model)
+                           VALUES (%s, %s, 'fakehash', 'test-model')""",
+                        (item_id, json.dumps([0.1, 0.2, 0.3])),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        scoped = _fetch_embeddings(niche="zz_test_cluster_niche")
+        scoped_ids = {item_id for item_id, _ in scoped}
+        assert set(target_item_ids) <= scoped_ids
+        assert not (set(other_item_ids) & scoped_ids)
+    finally:
+        _cleanup(target_handle)
+        _cleanup(other_handle)

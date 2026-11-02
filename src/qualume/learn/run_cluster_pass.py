@@ -152,12 +152,22 @@ def _label_cluster(item_ids: list[str]) -> str:
     return str(response.content).strip()
 
 
-def run_cluster_pass(applies_to_workflow_type: str) -> dict:
+def run_cluster_pass(applies_to_workflow_type: str, niche: str | None = None) -> dict:
     """Run one full Phase B pass: embed pending videos, cluster, label
     and propose significant findings, retire every previous cluster-
     sourced proposal (clusters have no stable identity across runs, so
     there's nothing to upsert-match against — a clean retire-then-
     propose each time is the honest behavior).
+
+    niche (added 2026-11-02, real fix for a real problem): when given,
+    scopes cluster_transcripts itself to only this niche's embeddings
+    (so HDBSCAN clusters within one real audience's vector space, not
+    a 10-niche mixed pool where "performed well" isn't comparable) AND
+    tags every proposed/retired insight with it, so retirement for a
+    niche-scoped pass only touches that niche's own rows (see
+    validation.retire_stale_external_insights' own niche scoping).
+    Still None by default — unscoped, original cross-niche behavior,
+    for any caller not yet looping per-niche.
 
     Returns: {embedding: {succeeded, failed}, clustering: {...}}. Mirrors
     orchestrate.run_ingestion_cycle's stage-isolation shape — one
@@ -187,7 +197,7 @@ def run_cluster_pass(applies_to_workflow_type: str) -> dict:
     }}
 
     try:
-        cluster_result = cluster_transcripts()
+        cluster_result = cluster_transcripts(niche=niche)
     except ValueError as e:
         result["clustering"] = {"skipped_reason": f"below sample floor: {e}"}
         return result
@@ -218,6 +228,7 @@ def run_cluster_pass(applies_to_workflow_type: str) -> dict:
         still_significant_identities=[],  # clusters have no stable identity — retire_all=True is what actually makes this real
         source="transcript_clustering",
         retire_all=True,  # bypasses identity matching entirely — see validation.py's real-bug-fix docstring (2026-10-30)
+        niche=niche,
     )
 
     for cluster in significant_clusters:
@@ -243,6 +254,7 @@ def run_cluster_pass(applies_to_workflow_type: str) -> dict:
                 "niches": niches,
             },
             source="transcript_clustering",
+            niche=niche,
         )
         proposed += 1
 

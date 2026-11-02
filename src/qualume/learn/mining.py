@@ -33,12 +33,25 @@ MINEABLE_COLUMNS = frozenset({
 })
 
 
-def mine_categorical_feature(column: str, min_group_size: int = 5) -> list[dict]:
+def mine_categorical_feature(column: str, min_group_size: int = 5, niche: str | None = None) -> list[dict]:
     """For every distinct real value of `column` seen in
     external_creative_dna, test whether videos WITH that value have a
     different performance-vs-account-median ratio than videos WITHOUT it
     (Mann-Whitney U — makes no normality assumption, appropriate for a
     skewed ratio metric with a small real sample).
+
+    niche (added 2026-11-02, real fix for a real problem): optionally
+    scopes the whole test to only videos from watched_accounts tagged
+    with this exact niche string. Found necessary once the real
+    watchlist grew from 2 niche-aligned accounts to 220 accounts spanning
+    totally unrelated niches (women's health, religion/philosophy,
+    fitness, food...) — pooling all of them makes every finding
+    uninterpretable (comparing a prenatal-vitamin video's performance
+    against a Quran-recitation video's has no real meaning; "performed
+    well" isn't comparable across audiences that different). Left
+    unscoped (None) by default so every existing caller — and the
+    original cross-account design intent of this function — keeps
+    working unchanged.
 
     Returns one dict per tested value (groups below min_group_size on
     either side are skipped, not padded or guessed):
@@ -59,8 +72,7 @@ def mine_categorical_feature(column: str, min_group_size: int = 5) -> list[dict]
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""SELECT ecd.external_content_item_id, ecd.{column}
+            query = f"""SELECT ecd.external_content_item_id, ecd.{column}
                     FROM external_creative_dna ecd
                     JOIN external_performance_snapshots eps
                       ON eps.external_content_item_id = ecd.external_content_item_id
@@ -94,7 +106,16 @@ def mine_categorical_feature(column: str, min_group_size: int = 5) -> list[dict]
                           WHERE eps2.external_content_item_id = ecd.external_content_item_id
                           ORDER BY eps2.ts DESC LIMIT 1
                       )"""
-            )
+            params: list = []
+            if niche is not None:
+                query += """
+                      AND ecd.external_content_item_id IN (
+                          SELECT eci.id FROM external_content_items eci
+                          JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+                          WHERE wa.niche = %s
+                      )"""
+                params.append(niche)
+            cur.execute(query, params)
             rows = cur.fetchall()
     finally:
         conn.close()

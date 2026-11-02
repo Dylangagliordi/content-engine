@@ -44,22 +44,43 @@ MIN_CLUSTER_SIZE_DEFAULT = 5  # mirrors mining.py's/copy_mining.py's own
 # isn't a real enough group to judge performance difference against.
 
 
-def _fetch_embeddings() -> list[tuple[str, list[float]]]:
+def _fetch_embeddings(niche: str | None = None) -> list[tuple[str, list[float]]]:
     """All (external_content_item_id, embedding) pairs currently stored.
     Real DB query, isolated into its own function so tests can patch it
-    directly rather than needing real embeddings in a test DB."""
+    directly rather than needing real embeddings in a test DB.
+
+    niche (added 2026-11-02, real fix for a real problem): optionally
+    scopes to only videos from watched_accounts tagged with this exact
+    niche string. Found necessary once the real watchlist grew from 2
+    niche-aligned accounts to 220 accounts spanning unrelated niches
+    (women's health, religion/philosophy, fitness, food...) — pooling
+    all of them into one clustering pass makes "performed well" an
+    incomparable notion across completely different audiences, and lets
+    HDBSCAN group videos whose only real similarity is an accident of
+    vector-space proximity, not a meaningful shared structure. niche is
+    NOT a column on transcript_embeddings itself — inherited from
+    watched_accounts via external_content_items, hence the real JOIN."""
     from qualume.db.connection import get_connection
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT external_content_item_id, embedding FROM transcript_embeddings")
+            query = "SELECT external_content_item_id, embedding FROM transcript_embeddings"
+            params: list = []
+            if niche is not None:
+                query += """ WHERE external_content_item_id IN (
+                    SELECT eci.id FROM external_content_items eci
+                    JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+                    WHERE wa.niche = %s
+                )"""
+                params.append(niche)
+            cur.execute(query, params)
             return [(str(item_id), embedding) for item_id, embedding in cur.fetchall()]
     finally:
         conn.close()
 
 
-def cluster_transcripts(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT) -> dict:
+def cluster_transcripts(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT, niche: str | None = None) -> dict:
     """Run HDBSCAN over every stored transcript embedding, test each real
     cluster's performance-vs-account-baseline ratio against everything
     OUTSIDE that cluster (Mann-Whitney U, same test mine_categorical_
@@ -74,7 +95,7 @@ def cluster_transcripts(min_cluster_size: int = MIN_CLUSTER_SIZE_DEFAULT) -> dic
     Raises ValueError below MIN_SAMPLE_SIZE real embeddings — same honest
     refuse-rather-than-fabricate behavior as learn.prediction.
     train_predictor's own sample-size floor."""
-    rows = _fetch_embeddings()
+    rows = _fetch_embeddings(niche=niche)
     if len(rows) < MIN_SAMPLE_SIZE:
         raise ValueError(
             f"cluster_transcripts needs at least {MIN_SAMPLE_SIZE} real embeddings, "

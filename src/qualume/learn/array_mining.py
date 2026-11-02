@@ -60,10 +60,34 @@ def _latest_rows_query(select_expr: str) -> str:
                )"""
 
 
-def discover_array_values(column: str, watched_account_id: str | None = None) -> set[str]:
+def _append_niche_filter(query: str, params: list, niche: str | None, content_item_expr: str) -> str:
+    """Shared AND clause builder (added 2026-11-02, real fix for a real
+    problem): scopes a query to only external_content_items whose owning
+    watched_accounts row has this exact niche. Appends the parameter to
+    `params` in place and returns the extended query string — used by
+    all 4 functions in this module so the real JOIN logic lives in one
+    place, not copy-pasted 4 times."""
+    if niche is None:
+        return query
+    query += f""" AND {content_item_expr} IN (
+        SELECT eci.id FROM external_content_items eci
+        JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+        WHERE wa.niche = %s
+    )"""
+    params.append(niche)
+    return query
+
+
+def discover_array_values(
+    column: str, watched_account_id: str | None = None, niche: str | None = None
+) -> set[str]:
     """Every real distinct value actually present anywhere in `column`
     across all (latest-version) videos — no hardcoded list, the data
-    decides what's worth testing."""
+    decides what's worth testing.
+
+    niche (added 2026-11-02, same real fix as every other mining
+    function): optionally scopes to only watched_accounts tagged with
+    this exact niche string."""
     if column not in MINEABLE_ARRAY_COLUMNS:
         raise ValueError(
             f"{column!r} is not a mineable array column. Allowed: {sorted(MINEABLE_ARRAY_COLUMNS)}"
@@ -87,6 +111,7 @@ def discover_array_values(column: str, watched_account_id: str | None = None) ->
                     SELECT id FROM external_content_items WHERE watched_account_id = %s
                 )"""
                 params.append(watched_account_id)
+            query = _append_niche_filter(query, params, niche, "ecd.external_content_item_id")
             cur.execute(query, params)
             return {row[0] for row in cur.fetchall()}
     finally:
@@ -94,11 +119,14 @@ def discover_array_values(column: str, watched_account_id: str | None = None) ->
 
 
 def discover_nested_field_values(
-    column: str, field: str, watched_account_id: str | None = None
+    column: str, field: str, watched_account_id: str | None = None, niche: str | None = None
 ) -> set[str]:
     """Every real distinct value of `field` seen across all presenters
     (or similar array-of-objects) entries — same no-hardcoded-list
-    discipline as discover_array_values."""
+    discipline as discover_array_values.
+
+    niche (added 2026-11-02, same real fix): optionally scopes to only
+    watched_accounts tagged with this exact niche string."""
     if (column, field) not in MINEABLE_NESTED_FIELDS:
         raise ValueError(
             f"({column!r}, {field!r}) is not a mineable nested field. "
@@ -124,6 +152,7 @@ def discover_nested_field_values(
                     SELECT id FROM external_content_items WHERE watched_account_id = %s
                 )"""
                 params.append(watched_account_id)
+            query = _append_niche_filter(query, params, niche, "ecd.external_content_item_id")
             cur.execute(query, params)
             return {row[0] for row in cur.fetchall() if row[0] is not None}
     finally:
@@ -131,12 +160,18 @@ def discover_nested_field_values(
 
 
 def mine_array_value(
-    column: str, value: str, min_group_size: int = 5, watched_account_id: str | None = None
+    column: str, value: str, min_group_size: int = 5, watched_account_id: str | None = None,
+    niche: str | None = None,
 ) -> dict | None:
     """Test whether videos with `value` present ANYWHERE in `column`'s
     array perform differently than videos without it (NULL array or
     array not containing the value both count as "without" — the value
     genuinely isn't present either way).
+
+    niche (added 2026-11-02, same real fix as every other mining
+    function in this project): optionally scopes to only watched_
+    accounts tagged with this exact niche string — found necessary once
+    the real watchlist grew to 220 accounts spanning unrelated niches.
 
     Returns None if either group falls below min_group_size, else:
     {value, n_with, n_without, median_ratio_with, median_ratio_without, p_value}.
@@ -156,6 +191,7 @@ def mine_array_value(
             if watched_account_id is not None:
                 query += " AND ecd.external_content_item_id IN (SELECT id FROM external_content_items WHERE watched_account_id = %s)"
                 params.append(watched_account_id)
+            query = _append_niche_filter(query, params, niche, "ecd.external_content_item_id")
             cur.execute(query, params)
             rows = cur.fetchall()
     finally:
@@ -190,13 +226,17 @@ def mine_array_value(
 
 def mine_nested_field_value(
     column: str, field: str, value: str, min_group_size: int = 5,
-    watched_account_id: str | None = None,
+    watched_account_id: str | None = None, niche: str | None = None,
 ) -> dict | None:
     """Test whether videos with `field`=`value` present on ANY entry in
     `column` (e.g. ANY presenter with relatable_archetype='mom') perform
     differently than videos without it. An empty array (no presenters at
     all — product-only/voiceover-over-broll shots) or an array where no
     entry has this value both count as "without".
+
+    niche (added 2026-11-02, same real fix as every other mining
+    function): optionally scopes to only watched_accounts tagged with
+    this exact niche string.
 
     Returns None if either group falls below min_group_size, else:
     {value, n_with, n_without, median_ratio_with, median_ratio_without, p_value}.
@@ -217,6 +257,7 @@ def mine_nested_field_value(
             if watched_account_id is not None:
                 query += " AND ecd.external_content_item_id IN (SELECT id FROM external_content_items WHERE watched_account_id = %s)"
                 params.append(watched_account_id)
+            query = _append_niche_filter(query, params, niche, "ecd.external_content_item_id")
             cur.execute(query, params)
             rows = cur.fetchall()
     finally:

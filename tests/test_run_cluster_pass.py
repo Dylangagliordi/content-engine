@@ -240,3 +240,30 @@ def test_run_cluster_pass_applies_benjamini_hochberg_across_clusters():
     # be rejected even though a flat p<0.05 would have let it through.
     mock_propose.assert_not_called()
     assert result["clustering"]["proposed"] == 0
+
+
+def test_run_cluster_pass_threads_niche_through_cluster_propose_and_retire():
+    """Real fix (2026-11-02): niche must reach cluster_transcripts (so
+    clustering only groups videos from one real niche's vector space,
+    not the whole mixed watchlist) AND propose/retire (so findings are
+    tagged and future retirement stays scoped to this niche)."""
+    fake_label_response = MagicMock()
+    fake_label_response.content = "Some real label"
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = fake_label_response
+
+    with patch("qualume.learn.run_cluster_pass._find_pending_embedding", return_value=[]), \
+         patch("qualume.learn.run_cluster_pass.cluster_transcripts") as mock_cluster, \
+         patch("qualume.learn.run_cluster_pass.pick_llm", return_value=fake_llm), \
+         patch("qualume.learn.run_cluster_pass._fetch_transcripts", return_value=["fake transcript"]), \
+         patch("qualume.learn.run_cluster_pass._fetch_niche_summary", return_value={"zz_test_niche"}), \
+         patch("qualume.learn.run_cluster_pass.propose_external_insight") as mock_propose, \
+         patch("qualume.learn.run_cluster_pass.retire_stale_external_insights", return_value=0) as mock_retire:
+
+        mock_cluster.return_value = _cluster_result(n_clusters=1, p_value=0.001)
+
+        run_cluster_pass(applies_to_workflow_type="tiktok_reels", niche="zz_test_niche")
+
+    mock_cluster.assert_called_once_with(niche="zz_test_niche")
+    assert mock_propose.call_args.kwargs["niche"] == "zz_test_niche"
+    assert mock_retire.call_args.kwargs["niche"] == "zz_test_niche"

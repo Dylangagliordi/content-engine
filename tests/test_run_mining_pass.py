@@ -294,3 +294,46 @@ def test_run_mining_pass_applies_benjamini_hochberg_across_the_whole_batch():
     mock_upsert.assert_not_called()
     assert result["tested"] == 20
     assert result["skipped_not_significant"] == 20
+
+
+def test_run_mining_pass_threads_niche_through_every_mine_call_and_upsert_retire(prefix=None):
+    """Real fix (2026-11-02): niche must reach EVERY underlying mine_*
+    call (so the test itself is scoped to one niche's videos) AND the
+    upsert/retire calls (so the resulting insight is tagged and future
+    retirement stays scoped to this niche) — the whole point of the fix
+    is useless if niche stops at run_mining_pass's own signature and
+    never actually reaches the real DB-touching calls underneath."""
+    with patch("qualume.learn.run_mining_pass.MINEABLE_COLUMNS", frozenset({"hook_type"})), \
+         patch("qualume.learn.run_mining_pass.MINEABLE_COPY_FLAGS", frozenset({"creates_urgency"})), \
+         patch("qualume.learn.run_mining_pass.MINEABLE_ARRAY_COLUMNS", frozenset({"music_mood_v2"})), \
+         patch("qualume.learn.run_mining_pass.MINEABLE_NESTED_FIELDS",
+               frozenset({("presenters", "relatable_archetype")})), \
+         patch("qualume.learn.run_mining_pass.mine_categorical_feature") as mock_mine_dna, \
+         patch("qualume.learn.run_mining_pass.mine_boolean_copy_feature") as mock_mine_copy, \
+         patch("qualume.learn.run_mining_pass.discover_array_values", return_value={"upbeat"}) as mock_disc_arr, \
+         patch("qualume.learn.run_mining_pass.discover_nested_field_values", return_value={"mom"}) as mock_disc_nested, \
+         patch("qualume.learn.run_mining_pass.mine_array_value") as mock_mine_array, \
+         patch("qualume.learn.run_mining_pass.mine_nested_field_value") as mock_mine_nested, \
+         patch("qualume.learn.run_mining_pass.upsert_external_insight") as mock_upsert, \
+         patch("qualume.learn.run_mining_pass.retire_stale_external_insights", return_value=0) as mock_retire:
+
+        mock_mine_dna.return_value = [_dna_result("question", p_value=0.01)]
+        mock_mine_copy.return_value = _copy_result("creates_urgency", p_value=0.01)
+        mock_mine_array.return_value = _array_result("upbeat", p_value=0.01)
+        mock_mine_nested.return_value = _array_result("mom", p_value=0.01)
+
+        run_mining_pass(applies_to_workflow_type="tiktok_video", niche="zz_test_niche_thread")
+
+    mock_mine_dna.assert_called_once_with("hook_type", min_group_size=5, niche="zz_test_niche_thread")
+    mock_mine_copy.assert_called_once_with("creates_urgency", min_group_size=5, niche="zz_test_niche_thread")
+    mock_disc_arr.assert_called_once_with("music_mood_v2", niche="zz_test_niche_thread")
+    mock_disc_nested.assert_called_once_with("presenters", "relatable_archetype", niche="zz_test_niche_thread")
+    mock_mine_array.assert_called_once_with("music_mood_v2", "upbeat", min_group_size=5, niche="zz_test_niche_thread")
+    mock_mine_nested.assert_called_once_with(
+        "presenters", "relatable_archetype", "mom", min_group_size=5, niche="zz_test_niche_thread"
+    )
+    assert mock_upsert.call_count == 4
+    for call in mock_upsert.call_args_list:
+        assert call.kwargs["niche"] == "zz_test_niche_thread"
+    mock_retire.assert_called_once()
+    assert mock_retire.call_args.kwargs["niche"] == "zz_test_niche_thread"

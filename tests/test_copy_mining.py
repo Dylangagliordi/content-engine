@@ -191,3 +191,38 @@ def test_mine_boolean_copy_feature_counts_each_video_once_even_with_multiple_per
 
     assert result is not None
     assert result["n_true"] == 5  # NOT 7 (the re-polled video triple-counted)
+
+
+def test_mine_boolean_copy_feature_scopes_to_one_niche_when_given(fake_account):
+    """Same real fix (2026-11-02) as learn.mining's own niche scoping —
+    the real watchlist now spans completely unrelated niches, pooling
+    them into one test makes findings uninterpretable."""
+    account_id, _ = fake_account
+    other_handle = f"test_copy_mining_other_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    try:
+        other_account_id = add_watched_account(
+            "tiktok", other_handle, niche="zz_test_other_niche"
+        )
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE watched_accounts SET niche = %s WHERE id = %s",
+                            ("zz_test_target_niche", account_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        for _ in range(6):
+            _insert_item_with_flag_and_views(account_id, "creates_urgency", True, 5000)
+        for _ in range(6):
+            _insert_item_with_flag_and_views(account_id, "creates_urgency", False, 1000)
+        # same True/views shape on the OTHER niche — must NOT count
+        for _ in range(6):
+            _insert_item_with_flag_and_views(other_account_id, "creates_urgency", True, 5000)
+
+        result = mine_boolean_copy_feature("creates_urgency", niche="zz_test_target_niche")
+        assert result is not None
+        assert result["n_true"] == 6  # only target-niche account's 6, not 12
+    finally:
+        _cleanup_account(other_handle)

@@ -223,3 +223,92 @@ def test_discover_array_values_returns_real_distinct_values_seen(fake_account):
     from qualume.learn.array_mining import discover_array_values
     values = discover_array_values("music_mood_v2", watched_account_id=account_id)
     assert values == {"upbeat", "pop", "calm"}
+
+
+def test_mine_array_value_scopes_to_one_niche_when_given(fake_account):
+    """Same real fix (2026-11-02) as every other mining module — the real
+    watchlist spans unrelated niches, pooling everything makes findings
+    uninterpretable."""
+    account_id, _ = fake_account
+    other_handle = f"test_arraymine_other_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    try:
+        other_account_id = add_watched_account("tiktok", other_handle, niche="zz_test_other_niche")
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE watched_accounts SET niche = %s WHERE id = %s",
+                            ("zz_test_target_niche", account_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        for _ in range(6):
+            _insert_video(account_id, 5000, music_mood_v2=["upbeat", "pop"])
+        for _ in range(6):
+            _insert_video(account_id, 1000, music_mood_v2=["calm", "sincere"])
+        for _ in range(6):
+            _insert_video(other_account_id, 5000, music_mood_v2=["upbeat", "pop"])
+
+        result = mine_array_value("music_mood_v2", "upbeat", min_group_size=5, niche="zz_test_target_niche")
+        assert result is not None
+        assert result["n_with"] == 6  # only target-niche account's 6, not 12
+    finally:
+        _cleanup_account(other_handle)
+
+
+def test_mine_nested_field_value_scopes_to_one_niche_when_given(fake_account):
+    account_id, _ = fake_account
+    other_handle = f"test_arraymine_other2_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    try:
+        other_account_id = add_watched_account("tiktok", other_handle, niche="zz_test_other_niche2")
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE watched_accounts SET niche = %s WHERE id = %s",
+                            ("zz_test_target_niche2", account_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        for _ in range(6):
+            _insert_video(account_id, 5000, presenters=[{"relatable_archetype": "mom"}])
+        for _ in range(6):
+            _insert_video(account_id, 1000, presenters=[{"relatable_archetype": "nurse"}])
+        for _ in range(6):
+            _insert_video(other_account_id, 5000, presenters=[{"relatable_archetype": "mom"}])
+
+        result = mine_nested_field_value(
+            "presenters", "relatable_archetype", "mom", min_group_size=5,
+            niche="zz_test_target_niche2",
+        )
+        assert result is not None
+        assert result["n_with"] == 6  # only target-niche account's 6, not 12
+    finally:
+        _cleanup_account(other_handle)
+
+
+def test_discover_array_values_scopes_to_one_niche_when_given(fake_account):
+    account_id, _ = fake_account
+    other_handle = f"test_arraymine_other3_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    try:
+        other_account_id = add_watched_account("tiktok", other_handle, niche="zz_test_other_niche3")
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE watched_accounts SET niche = %s WHERE id = %s",
+                            ("zz_test_target_niche3", account_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        _insert_video(account_id, 1000, music_mood_v2=["upbeat"])
+        _insert_video(other_account_id, 1000, music_mood_v2=["only_in_other_niche"])
+
+        from qualume.learn.array_mining import discover_array_values
+        values = discover_array_values("music_mood_v2", niche="zz_test_target_niche3")
+        assert values == {"upbeat"}  # not "only_in_other_niche"
+    finally:
+        _cleanup_account(other_handle)

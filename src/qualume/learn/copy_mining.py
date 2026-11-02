@@ -29,7 +29,8 @@ MINEABLE_COPY_FLAGS = frozenset(copy_technique_names())
 
 
 def mine_boolean_copy_feature(
-    flag: str, min_group_size: int = 5, watched_account_id: str | None = None
+    flag: str, min_group_size: int = 5, watched_account_id: str | None = None,
+    niche: str | None = None,
 ) -> dict | None:
     """Test whether videos with `flag`=True perform differently
     (performance-vs-account-median ratio) than videos with `flag`=False.
@@ -46,6 +47,14 @@ def mine_boolean_copy_feature(
     but tests need it to avoid colliding with whatever real external
     data already exists in the dev DB (same no-separate-test-DB caveat
     as every other test in this project - see CLAUDE.md).
+
+    niche (added 2026-11-02, same real fix as learn.mining.
+    mine_categorical_feature): optionally scopes to only videos from
+    watched_accounts tagged with this exact niche string — found
+    necessary once the real watchlist grew to 220 accounts spanning
+    unrelated niches, where pooling everything makes findings
+    uninterpretable. Can be combined with watched_account_id (though in
+    practice callers use one or the other, not both).
 
     Returns None if either group falls below min_group_size (not enough
     signal either way), else:
@@ -94,6 +103,13 @@ def mine_boolean_copy_feature(
                     SELECT id FROM external_content_items WHERE watched_account_id = %s
                 )"""
                 params.append(watched_account_id)
+            if niche is not None:
+                query += """ AND eca.external_content_item_id IN (
+                    SELECT eci.id FROM external_content_items eci
+                    JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+                    WHERE wa.niche = %s
+                )"""
+                params.append(niche)
             cur.execute(query, params)
             rows = cur.fetchall()
     finally:
