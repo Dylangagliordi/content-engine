@@ -171,15 +171,33 @@ def run_ingestion_cycle() -> dict:
     hand."""
     result: dict = {}
 
-    try:
-        result["poll"] = run_poll_cycle()
-    except Exception as e:
-        result["poll"] = {"error": f"{type(e).__name__}: {e}"}
+    import os
 
-    try:
-        result["download"] = download_pending_videos()
-    except Exception as e:
-        result["download"] = {"error": f"{type(e).__name__}: {e}"}
+    # Real user decision 2026-11-01 ("stop downloading"): pause poll +
+    # download permanently until explicitly re-enabled, while
+    # annotation/classification/mining/clustering keep running on
+    # whatever's already downloaded. Real reason: at the time this was
+    # added, ~9755 videos were already downloaded but only ~10% had been
+    # annotated — annotation throughput, not download volume, was the
+    # actual bottleneck, so growing the download backlog further was
+    # actively unhelpful. Checked live via env var (not a code comment
+    # someone has to remember to revert), same "read live, don't
+    # hardcode a decision" discipline as DNA_ANALYSIS_PROMPT_VERSION.
+    # Opt-in: unset (the default) means poll/download run exactly as
+    # before, no silent new default for every existing deployment.
+    if os.environ.get("QUALUME_PAUSE_INGESTION"):
+        result["poll"] = {"skipped": "QUALUME_PAUSE_INGESTION is set"}
+        result["download"] = {"skipped": "QUALUME_PAUSE_INGESTION is set"}
+    else:
+        try:
+            result["poll"] = run_poll_cycle()
+        except Exception as e:
+            result["poll"] = {"error": f"{type(e).__name__}: {e}"}
+
+        try:
+            result["download"] = download_pending_videos()
+        except Exception as e:
+            result["download"] = {"error": f"{type(e).__name__}: {e}"}
 
     try:
         pending_annotation = find_pending_annotation()
