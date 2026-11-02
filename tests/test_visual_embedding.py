@@ -111,7 +111,18 @@ class TestEmbedAndStore:
         """Insert a real external_content_items row (minimal required
         fields) + a real external_creative_dna row pointing at it, using
         the project's own get_connection — returns the new content item
-        id so the test can call embed_and_store against something real."""
+        id so the test can call embed_and_store against something real.
+
+        platform_video_id includes a random suffix (added after a real
+        bug: a hardcoded f"test_visual_embed_{video_path}" id collided
+        on the real UNIQUE(platform, platform_video_id) constraint any
+        time this test ran twice without the previous run's cleanup
+        having happened yet — e.g. two overlapping pytest invocations
+        both picking up the same first file from data/raw_videos/*.mp4,
+        a real production scenario during this session's concurrent
+        background test runs, not just a hypothetical)."""
+        import uuid
+
         from qualume.db.connection import get_connection
 
         conn = get_connection()
@@ -124,7 +135,7 @@ class TestEmbedAndStore:
                        SELECT id, 'tiktok', %s, %s, %s, %s
                        FROM watched_accounts LIMIT 1
                        RETURNING id""",
-                    (f"test_visual_embed_{video_path}",
+                    (f"test_visual_embed_{uuid.uuid4().hex}",
                      f"https://tiktok.com/test/{video_path}", video_path, duration),
                 )
                 content_item_id = cur.fetchone()[0]
