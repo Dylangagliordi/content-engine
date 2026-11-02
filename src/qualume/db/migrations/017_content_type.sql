@@ -1,0 +1,24 @@
+-- external_content_items.content_type: 'selling' | 'organic' | NULL (not
+-- yet classified). Added 2026-11-02, real fix for a real gap: niche
+-- (migration 015) scopes WHAT TOPIC a video is about, but there was no
+-- field at all for WHETHER a video is a selling/ad piece vs organic
+-- content — a second, independent axis. A DTC-brand or TikTok-Shop
+-- account can post BOTH organic story-time content AND hard-sell ads,
+-- so this can't be inferred from watched_accounts alone; it needs its
+-- own classification pass per video (same shape as external_copy_
+-- analysis's existing creates_urgency/hook_pain_callout boolean flags).
+--
+-- Meta Ad Library sourced videos (platform='meta_ads', added alongside
+-- this migration) are selling-by-definition — every ad in the Ad
+-- Library is, by construction, a paid selling video — so those rows can
+-- be seeded content_type='selling' directly at ingestion time with no
+-- classifier call needed. TikTok-sourced videos still need the real
+-- classifier to decide, since an organic TikTok account's own video
+-- could be either.
+--
+-- Nullable, not a hard default: existing rows ingested before this
+-- migration have no classification yet, and NULL honestly means "not
+-- yet classified" rather than silently defaulting to 'organic' (the
+-- numerically dominant case so far) and masking real selling content
+-- that hasn't been scanned yet.
+ALTER TABLE external_content_items ADD COLUMN content_type TEXT;
