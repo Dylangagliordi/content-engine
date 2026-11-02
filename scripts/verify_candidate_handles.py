@@ -15,8 +15,8 @@ import time
 
 import yt_dlp
 
-INPUT = "data/candidate_handles.txt"
-OUTPUT = "data/candidate_handles_verified.csv"
+INPUT = sys.argv[1] if len(sys.argv) > 1 else "data/candidate_handles.txt"
+OUTPUT = sys.argv[2] if len(sys.argv) > 2 else "data/candidate_handles_verified.csv"
 DELAY_SECONDS = 1.5
 
 
