@@ -30,6 +30,7 @@ import time
 from typing import NamedTuple, TypeVar
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
@@ -57,6 +58,35 @@ ANALYSIS_PROMPT_VERSION = "v6"
 # stabilizes — re-check periodically, same re-verify command pattern as before:
 #   uv run python -c "from google import genai; import os; from dotenv import load_dotenv; load_dotenv(); print(genai.Client(api_key=os.environ['GEMINI_API_KEY']).models.get(model='models/gemini-3.8-flash'))"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
+
+# Real fix, 2026-11-03 ("ensure annotations get sped up"): GEMINI_MODEL's
+# free-tier quota is 500 requests/day (confirmed live via Google's own
+# rate-limits docs, ai.google.dev/gemini-api/docs/rate-limits — "Limits
+# vary depending on the specific model being used"), and the real
+# annotation backlog at the time this was added was ~10,400 videos —
+# 500/day alone would take 20+ days to clear. gemini-3.5-flash-lite is a
+# genuinely SEPARATE model with its OWN separate 500 RPD free-tier quota
+# (same docs: limits are per-model, not pooled across a project) —
+# verified live that it successfully watches video (plain-text prompt
+# succeeds), roughly doubling real daily annotation throughput for free.
+#
+# BUT: verified live that gemini-3.5-flash-lite returns a persistent 503
+# ServerError specifically when a strict response_schema is attached
+# alongside video input (same general 503-on-video-input class of issue
+# as gemini-3.8-flash/flash-latest/3.7-flash above, just a narrower
+# trigger — schema+video, not video alone). Dropping the strict schema
+# (keep response_mime_type='application/json', drop response_schema)
+# avoids the 503 and produces real, correctly-shaped JSON — annotate_video
+# falls back to this model+config specifically ON a 503 from the primary
+# model, and routes the result through this project's EXISTING degraded-
+# path validation (best-effort field extraction, raw_response/
+# validation_error stored) rather than a new code path, since that path
+# already handles "valid JSON, doesn't fully match the strict schema."
+# Re-verify periodically (same pattern as GEMINI_MODEL above) in case a
+# future SDK/model update fixes the schema+video 503 and a strict call
+# becomes possible here too.
+GEMINI_MODEL_FALLBACK = "gemini-3.5-flash-lite"
+
 
 # A single generate_content call has no cross-call state; the only lever for
 # run-to-run consistency on the same video is sampling variance. Gemini's API
@@ -416,6 +446,12 @@ class AnnotationResult(NamedTuple):
     validation_error: str | None = None  # set when annotation is None, explains why
     coverage_warning: str | None = None  # "; "-joined _check_coverage warnings for a
                                           # VALID annotation; None if complete or invalid
+    model_used: str = GEMINI_MODEL  # real fix, 2026-11-03: WHICH model actually produced
+                                     # this result — GEMINI_MODEL on the normal path,
+                                     # GEMINI_MODEL_FALLBACK when the primary 503'd and the
+                                     # fallback served instead. annotate_and_store persists
+                                     # this into analysis_model; defaulting to GEMINI_MODEL
+                                     # keeps every pre-fallback caller's behavior unchanged.
 
 
 def _gemini_client() -> genai.Client:
@@ -449,7 +485,16 @@ def annotate_video(local_video_path: str, video_duration_seconds: float | None) 
     """Upload one video to Gemini, have it watch it, return validated DNA
     alongside the complete raw response. video_duration_seconds is the real
     duration (yt-dlp metadata), passed in rather than looked up so this
-    stays DB-free; it's only used for the coverage check."""
+    stays DB-free; it's only used for the coverage check.
+
+    Real fallback (2026-11-03): on a 503 from GEMINI_MODEL (the real,
+    confirmed-live daily-quota/high-demand failure mode, not a generic
+    catch-all), retries once against GEMINI_MODEL_FALLBACK WITHOUT a
+    strict response_schema (confirmed live: the schema is what triggers
+    an identical 503 on this second model specifically for video input).
+    A non-503 error (e.g. a genuine 400 bad request) is NOT retried —
+    propagates as before, so this fix doesn't mask real bugs behind a
+    second model's different failure mode."""
     if not os.path.isfile(local_video_path):
         raise FileNotFoundError(f"Video file not found: {local_video_path}")
     client = _gemini_client()
@@ -457,15 +502,32 @@ def annotate_video(local_video_path: str, video_duration_seconds: float | None) 
     uploaded = client.files.upload(file=local_video_path)
     try:
         video = _wait_until_active(client, uploaded)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[video, ANNOTATION_PROMPT],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ExternalVideoAnnotationV6,
-                temperature=GEMINI_TEMPERATURE,
-            ),
-        )
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[video, ANNOTATION_PROMPT],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ExternalVideoAnnotationV6,
+                    temperature=GEMINI_TEMPERATURE,
+                ),
+            )
+            model_used = GEMINI_MODEL
+        except genai_errors.ServerError as e:
+            if getattr(e, "code", None) != 503:
+                raise
+            # Real fallback: same video, second model, no strict schema
+            # (confirmed live this specific combination avoids the 503 on
+            # GEMINI_MODEL_FALLBACK). Re-raises anything else untouched.
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_FALLBACK,
+                contents=[video, ANNOTATION_PROMPT],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=GEMINI_TEMPERATURE,
+                ),
+            )
+            model_used = GEMINI_MODEL_FALLBACK
         # Validate the raw text ourselves: the SDK's response.parsed silently
         # becomes None on a validation failure instead of raising.
         if not response.text:
@@ -481,14 +543,18 @@ def annotate_video(local_video_path: str, video_duration_seconds: float | None) 
             # Don't lose the raw response just because our strict schema (e.g.
             # chronological-order checks) rejected it — row 5 above. Capture
             # what Gemini actually said; annotate_and_store decides how to
-            # store a row even when typed-field validation failed.
+            # store a row even when typed-field validation failed. This same
+            # path also catches the fallback model's occasional out-of-enum
+            # values (e.g. tone_category='excited') — no new handling needed.
             return AnnotationResult(
-                annotation=None, raw_response=raw_response, validation_error=str(e)
+                annotation=None, raw_response=raw_response, validation_error=str(e),
+                model_used=model_used,
             )
         warnings = _check_coverage(annotation, video_duration_seconds)
         return AnnotationResult(
             annotation=annotation, raw_response=raw_response,
             coverage_warning="; ".join(warnings) or None,
+            model_used=model_used,
         )
     finally:
         # Uploaded files auto-expire after ~48h; delete now to not leave them around.
@@ -531,9 +597,9 @@ def annotate_and_store(external_content_item_id: str) -> str:
             )
 
         result = annotate_video(local_video_path, duration_seconds)
-        ann, raw_response, validation_error, coverage_warning = (
+        ann, raw_response, validation_error, coverage_warning, model_used = (
             result.annotation, result.raw_response, result.validation_error,
-            result.coverage_warning,
+            result.coverage_warning, result.model_used,
         )
 
         if ann is not None:
@@ -640,7 +706,7 @@ def annotate_and_store(external_content_item_id: str) -> str:
                     values["presenters"], values["delivery_mode"],
                     values["video_topic_summary"], values["scene_description"],
                     Json(raw_response), validation_error, coverage_warning,
-                    GEMINI_MODEL, ANALYSIS_PROMPT_VERSION,
+                    model_used, ANALYSIS_PROMPT_VERSION,
                 ),
             )
             dna_id = str(cur.fetchone()[0])
