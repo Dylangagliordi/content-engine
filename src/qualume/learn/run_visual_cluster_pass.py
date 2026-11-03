@@ -151,7 +151,10 @@ def _label_cluster(item_ids: list[str]) -> str:
     )
     llm = pick_llm("low")
     response = llm.invoke(prompt)
-    return str(response.content).strip()
+    # response.text, not str(response.content) — see run_cluster_pass.
+    # _label_cluster's identical 2026-11-03 fix for the same Claude->Gemini
+    # content-shape bug (plain string vs. list-of-content-blocks).
+    return response.text.strip()
 
 
 def run_visual_cluster_pass(applies_to_workflow_type: str, niche: str | None = None) -> dict:

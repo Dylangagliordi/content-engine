@@ -149,7 +149,15 @@ def _label_cluster(item_ids: list[str]) -> str:
     )
     llm = pick_llm("low")
     response = llm.invoke(prompt)
-    return str(response.content).strip()
+    # response.text (NOT str(response.content)) — real bug found 2026-11-03
+    # switching 'low' from Claude to Gemini: Claude's AIMessage.content is a
+    # plain string, but Gemini's (via langchain-google-genai) is a list of
+    # content blocks ([{'type': 'text', 'text': ..., 'extras': {...}}]), so
+    # str(response.content) stringified the whole list (including an opaque
+    # signature blob) into the stored label instead of the clean text.
+    # .text is langchain-core's own provider-agnostic accessor, confirmed
+    # live to normalize both shapes correctly.
+    return response.text.strip()
 
 
 def run_cluster_pass(applies_to_workflow_type: str, niche: str | None = None) -> dict:

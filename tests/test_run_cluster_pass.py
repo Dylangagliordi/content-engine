@@ -114,7 +114,7 @@ def test_run_cluster_pass_skips_clustering_below_sample_floor():
 
 def test_run_cluster_pass_labels_and_proposes_significant_clusters():
     fake_label_response = MagicMock()
-    fake_label_response.content = "Mega Live sale event announcements"
+    fake_label_response.text = "Mega Live sale event announcements"
 
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = fake_label_response
@@ -248,7 +248,7 @@ def test_run_cluster_pass_threads_niche_through_cluster_propose_and_retire():
     not the whole mixed watchlist) AND propose/retire (so findings are
     tagged and future retirement stays scoped to this niche)."""
     fake_label_response = MagicMock()
-    fake_label_response.content = "Some real label"
+    fake_label_response.text = "Some real label"
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = fake_label_response
 

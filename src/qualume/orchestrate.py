@@ -57,22 +57,64 @@ def find_pending_annotation(watched_account_id: str | None = None) -> list[str]:
     itself was already producing v6 output correctly when called by hand.
     An item with only an older version, e.g. v1, still counts as pending —
     same "always annotate forward to the latest version" discipline the
-    rest of this project uses)."""
+    rest of this project uses).
+
+    Ordered by sample-floor priority (real fix, 2026-11-03): items whose
+    niche is furthest below learn.transcript_clustering.MIN_SAMPLE_SIZE
+    (40 annotated videos) come FIRST. Default insertion/FIFO order
+    actively fought the project's own stated goal — only 5/27 niches
+    ever cleared the clustering floor because whatever got downloaded
+    earliest got annotated first, regardless of which niche most needed
+    annotation volume. A niche with 0 annotated videos (e.g. a brand-new
+    medspa/peptide watchlist added today) now jumps ahead of an
+    already-saturated niche like fitness (344 annotated) that gains
+    nothing from more annotation volume right now. Items with a NULL
+    niche (not yet classified) sort last — same as any niche already
+    past the floor, since there's no real floor-urgency signal for them
+    either way. Ties within the same priority broken by insertion order
+    (id), same as the original behavior, not left to be nondeterministic.
+    """
     from qualume.db.connection import get_connection
+    from qualume.learn.transcript_clustering import MIN_SAMPLE_SIZE
 
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            query = """SELECT eci.id FROM external_content_items eci
-                       WHERE eci.local_video_path IS NOT NULL
-                         AND eci.id NOT IN (
-                             SELECT external_content_item_id FROM external_creative_dna
-                             WHERE analysis_prompt_version = %s
-                         )"""
-            params: list = [DNA_ANALYSIS_PROMPT_VERSION]
+            query = """
+                WITH niche_annotated_counts AS (
+                    SELECT wa.niche, count(DISTINCT ecd.external_content_item_id) AS annotated_count
+                    FROM watched_accounts wa
+                    LEFT JOIN external_content_items eci2 ON eci2.watched_account_id = wa.id
+                    LEFT JOIN external_creative_dna ecd ON ecd.external_content_item_id = eci2.id
+                        AND ecd.analysis_prompt_version = %s
+                    GROUP BY wa.niche
+                )
+                SELECT eci.id
+                FROM external_content_items eci
+                JOIN watched_accounts wa ON wa.id = eci.watched_account_id
+                LEFT JOIN niche_annotated_counts nac ON nac.niche = wa.niche
+                WHERE eci.local_video_path IS NOT NULL
+                  AND eci.id NOT IN (
+                      SELECT external_content_item_id FROM external_creative_dna
+                      WHERE analysis_prompt_version = %s
+                  )
+            """
+            params: list = [DNA_ANALYSIS_PROMPT_VERSION, DNA_ANALYSIS_PROMPT_VERSION]
             if watched_account_id is not None:
                 query += " AND eci.watched_account_id = %s"
                 params.append(watched_account_id)
+            # GREATEST(..., 0): a niche already past MIN_SAMPLE_SIZE gets
+            # priority 0 (same as NULL/unclassified) rather than a
+            # negative number — being FURTHER past the floor isn't
+            # "more done", it's just equally not-urgent.
+            query += """
+                ORDER BY
+                    CASE WHEN wa.niche IS NULL THEN 0
+                         ELSE GREATEST(%s - COALESCE(nac.annotated_count, 0), 0)
+                    END DESC,
+                    eci.id
+            """
+            params.append(MIN_SAMPLE_SIZE)
             cur.execute(query, params)
             return [str(row[0]) for row in cur.fetchall()]
     finally:

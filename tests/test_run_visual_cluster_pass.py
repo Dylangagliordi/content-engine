@@ -125,7 +125,7 @@ def test_run_visual_cluster_pass_skips_clustering_below_sample_floor():
 
 def test_run_visual_cluster_pass_labels_and_proposes_significant_clusters():
     fake_label_response = MagicMock()
-    fake_label_response.content = "Fast-cut product demo close-ups"
+    fake_label_response.text = "Fast-cut product demo close-ups"
 
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = fake_label_response
@@ -243,7 +243,7 @@ def test_run_visual_cluster_pass_threads_niche_through_cluster_propose_and_retir
     findings are tagged and future retirement stays scoped to this
     niche)."""
     fake_label_response = MagicMock()
-    fake_label_response.content = "Some real visual label"
+    fake_label_response.text = "Some real visual label"
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = fake_label_response
 
