@@ -1,7 +1,8 @@
 """Ingestion orchestration — the single entry point n8n's Schedule
 Trigger calls (via the local HTTP wrapper, see server.py) to run one full
 cycle of the pipeline: poll watchlist -> download pending videos ->
-annotate pending (Gemini v5) -> classify copy for newly-annotated videos.
+annotate pending (Gemini v5) -> classify copy -> classify content_type
+for newly-annotated videos.
 
 Every underlying step is already idempotent on its own (polling dedupes
 on platform_video_id, download_pending_videos only touches NULL
@@ -15,6 +16,7 @@ poll_tiktok_watchlist's per-account isolation) — this is the real shape
 a scheduled, unattended job on an always-on host needs: one bad video or
 one transient API 503 must never silently stop the whole cycle.
 """
+from qualume.annotate.content_type_classifier import classify_and_store_content_type
 from qualume.annotate.copy_classifier import classify_and_store_external
 from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALYSIS_PROMPT_VERSION
 from qualume.annotate.gemini_watcher import annotate_and_store
@@ -99,6 +101,37 @@ def find_pending_classification(watched_account_id: str | None = None) -> list[s
                          AND ecd.external_content_item_id NOT IN (
                              SELECT external_content_item_id FROM external_copy_analysis
                          )"""
+            params: list = [DNA_ANALYSIS_PROMPT_VERSION]
+            if watched_account_id is not None:
+                query += " AND eci.watched_account_id = %s"
+                params.append(watched_account_id)
+            cur.execute(query, params)
+            return [str(row[0]) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def find_pending_content_type_classification(watched_account_id: str | None = None) -> list[str]:
+    """TikTok external_content_items with a CURRENT-version annotation
+    (same live DNA_ANALYSIS_PROMPT_VERSION discipline as find_pending_
+    classification above) but no content_type set yet (migration 017).
+
+    Scoped to platform='tiktok' only — meta_ads items are selling-by-
+    definition and already get content_type seeded directly at ingest
+    (see meta_ads_reader.parse_ad_entry), so they're never genuinely
+    pending here; including them would just waste a classifier call
+    re-confirming something already known for certain."""
+    from qualume.db.connection import get_connection
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            query = """SELECT DISTINCT ecd.external_content_item_id
+                       FROM external_creative_dna ecd
+                       JOIN external_content_items eci ON eci.id = ecd.external_content_item_id
+                       WHERE ecd.analysis_prompt_version = %s
+                         AND eci.platform = 'tiktok'
+                         AND eci.content_type IS NULL"""
             params: list = [DNA_ANALYSIS_PROMPT_VERSION]
             if watched_account_id is not None:
                 query += " AND eci.watched_account_id = %s"
@@ -214,6 +247,23 @@ def run_ingestion_cycle() -> dict:
         )
     except Exception as e:
         result["classification"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # content_type classification — added 2026-11-02. Same stage
+        # shape/isolation as classification above, but TikTok-only
+        # (find_pending_content_type_classification already excludes
+        # meta_ads, which gets content_type seeded for free at ingest —
+        # see meta_ads_reader.parse_ad_entry). This closes the real gap
+        # that made niche-scoped/content_type-scoped clustering
+        # impossible for TikTok content: without this stage running,
+        # content_type stays NULL forever for every TikTok video.
+        pending_content_type = find_pending_content_type_classification()
+        result["content_type_classification"] = _run_stage_over_items(
+            pending_content_type, classify_and_store_content_type,
+            max_workers=CLASSIFICATION_CONCURRENCY,
+        )
+    except Exception as e:
+        result["content_type_classification"] = {"error": f"{type(e).__name__}: {e}"}
 
     try:
         # tiktok_reels is the only real workflow_type with external data

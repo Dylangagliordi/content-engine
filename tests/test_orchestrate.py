@@ -29,6 +29,7 @@ from qualume.db.watchlist import add_watched_account
 from qualume.orchestrate import (
     find_pending_annotation,
     find_pending_classification,
+    find_pending_content_type_classification,
     run_ingestion_cycle,
 )
 
@@ -180,6 +181,39 @@ def test_find_pending_annotation_treats_a_current_version_item_as_not_pending_ev
     assert item_id not in pending
 
 
+def test_find_pending_content_type_classification_returns_tiktok_items_with_dna_but_no_content_type(
+    fake_account,
+):
+    """Real gap closed 2026-11-02: content_type (migration 017) can't be
+    inferred from platform/account for TikTok (unlike meta_ads, which
+    is selling-by-definition and seeded at ingest) — needs its own real
+    classification pass, same 'find what's genuinely missing' shape as
+    every other pending-finder in orchestrate.py."""
+    account_id, _ = fake_account
+    item_ready = _insert_item(account_id)
+    _insert_dna(item_ready, version=DNA_VERSION)
+    item_no_dna_yet = _insert_item(account_id)
+    item_already_classified = _insert_item(account_id)
+    _insert_dna(item_already_classified, version=DNA_VERSION)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE external_content_items SET content_type = 'organic' WHERE id = %s",
+                (item_already_classified,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    pending = find_pending_content_type_classification(watched_account_id=account_id)
+
+    assert item_ready in pending
+    assert item_no_dna_yet not in pending  # no DNA yet -> nothing to classify from
+    assert item_already_classified not in pending
+
+
 def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account):
     account_id, handle = fake_account
 
@@ -187,8 +221,10 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
          patch("qualume.orchestrate.download_pending_videos") as mock_download, \
          patch("qualume.orchestrate.annotate_and_store") as mock_annotate, \
          patch("qualume.orchestrate.classify_and_store_external") as mock_classify, \
+         patch("qualume.orchestrate.classify_and_store_content_type") as mock_classify_ctype, \
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
+         patch("qualume.orchestrate.find_pending_content_type_classification") as mock_find_ctype, \
          patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
          patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
          patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
@@ -199,6 +235,8 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
         mock_annotate.side_effect = ["dna-a", "dna-b"]
         mock_find_cls.return_value = ["item-a", "item-b"]
         mock_classify.side_effect = ["copy-a", "copy-b"]
+        mock_find_ctype.return_value = ["item-a", "item-b"]
+        mock_classify_ctype.side_effect = ["item-a", "item-b"]
         mock_mining.return_value = {
             "tested": 5, "proposed_or_refreshed": 2,
             "skipped_not_significant": 3, "retired": 0, "errors": [],
@@ -220,6 +258,8 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
     assert result["annotation"]["failed"] == 0
     assert result["classification"]["succeeded"] == 2
     assert result["classification"]["failed"] == 0
+    assert result["content_type_classification"]["succeeded"] == 2
+    assert result["content_type_classification"]["failed"] == 0
     assert result["mining"] == mock_mining.return_value
     mock_mining.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
     assert result["clustering"] == mock_cluster.return_value
