@@ -147,6 +147,43 @@ def test_feature_importance_produces_a_real_r2_and_ranked_features(niche_with_20
     assert isinstance(fi["top_features"], list)
 
 
+def test_embedding_components_get_interpretable_labels_not_raw_emb_n(niche_with_20_videos):
+    """The real gap this closes: raw 'emb_2'/'emb_3' feature names are
+    semantically meaningless (an arbitrary PCA-reduced direction through a
+    384-dim sentence embedding space) — a human reading feature_importance
+    output has no way to act on 'emb_2 matters'. Any top_feature whose
+    raw_feature starts with 'emb_' must carry a human-readable interpretation
+    (contrasting keywords from the captions with the highest vs lowest
+    projection on that PCA axis) instead of being left as an opaque label."""
+    df = load_niche_dataframe(niches=[niche_with_20_videos], min_niche_size=5)
+    results = run_ml(df, niche_with_20_videos)
+    fi = results["feature_importance"]
+    assert fi["status"] == "ok"
+    emb_features = [f for f in fi["top_features"] if f["raw_feature"].startswith("emb_")]
+    for f in emb_features:
+        assert "interpretation" in f, f"emb feature {f['raw_feature']} has no interpretation"
+        interp = f["interpretation"]
+        assert "high_keywords" in interp
+        assert "low_keywords" in interp
+        assert "high_examples" in interp
+        assert "low_examples" in interp
+
+
+def test_explain_embedding_component_returns_keywords_and_examples(niche_with_20_videos):
+    df = load_niche_dataframe(niches=[niche_with_20_videos], min_niche_size=5)
+    from qualume.okn_mirror.ml_engine_okn import MLEngine
+    engine = MLEngine(df, niche_with_20_videos)
+    if engine.embeddings is None:
+        pytest.skip("embeddings unavailable in this environment")
+    result = engine._explain_embedding_component(0)
+    assert "high_keywords" in result
+    assert "low_keywords" in result
+    assert "high_examples" in result
+    assert "low_examples" in result
+    assert isinstance(result["high_examples"], list)
+    assert len(result["high_examples"]) > 0
+
+
 def test_content_clustering_produces_k_clusters_summing_to_total_posts(niche_with_20_videos):
     df = load_niche_dataframe(niches=[niche_with_20_videos], min_niche_size=5)
     results = run_ml(df, niche_with_20_videos)

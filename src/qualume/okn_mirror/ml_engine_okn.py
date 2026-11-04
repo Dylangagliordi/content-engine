@@ -248,17 +248,87 @@ class MLEngine:
                 "duration_sec": "Video Duration", "is_organic": "Organic Content",
                 "is_selling": "Selling Content", "is_unclassified": "Unclassified Content",
             }
+            top_features = []
+            for f, imp in feature_ranking[:8]:
+                if imp <= 0.01:
+                    continue
+                entry = {"feature": readable_names.get(f, f), "raw_feature": f,
+                         "importance": round(float(imp), 4), "pct": round(float(imp) * 100, 1)}
+                # Real gap this closes (user: "whats the point of [embeddings]
+                # if we cant see them"): raw emb_N is an opaque PCA-reduced
+                # direction through a 384-dim sentence embedding — no human
+                # can act on "emb_2 matters 55%". Attach a real interpretation
+                # by contrasting the actual captions at each end of that axis.
+                if f.startswith("emb_"):
+                    component_idx = int(f.split("_")[1])
+                    entry["interpretation"] = self._explain_embedding_component(component_idx)
+                top_features.append(entry)
             return {
                 "status": "ok", "model": "GradientBoosting (100 trees)",
                 "r2_score": round(float(gb.score(X, y)), 4),
-                "top_features": [
-                    {"feature": readable_names.get(f, f), "raw_feature": f,
-                     "importance": round(float(imp), 4), "pct": round(float(imp) * 100, 1)}
-                    for f, imp in feature_ranking[:8] if imp > 0.01
-                ],
+                "top_features": top_features,
             }
         except Exception as e:
             return {"status": "failed", "error": str(e)}
+
+    def _explain_embedding_component(self, component_idx: int, n_examples: int = 5, n_keywords: int = 5) -> Dict:
+        """Make one PCA-reduced embedding dimension (emb_{component_idx})
+        human-readable. The embedding vector itself has no inherent meaning
+        (it's a learned direction through sentence-embedding space, not a
+        named concept) — but the CAPTIONS at the extreme ends of that axis
+        do. Standard embedding-interpretability technique: sort real
+        captions by their projection onto this one PCA component, take the
+        top/bottom-N, and extract what they have in common (TF-IDF keywords
+        + the raw example captions themselves) so a human can read "high
+        emb_2 = X-style captions, low emb_2 = Y-style captions" instead of
+        an opaque number.
+
+        Requires self.pca and self.embeddings (set in _extract_features when
+        sentence-transformers succeeded and n_components didn't exceed
+        max_valid — see that method's docstring). Returns a dict with
+        high_keywords/low_keywords/high_examples/low_examples; never raises
+        — any internal failure degrades to empty lists, same honest-gap
+        discipline as the rest of this engine."""
+        try:
+            if not hasattr(self, "pca") or self.embeddings is None:
+                return {"high_keywords": [], "low_keywords": [], "high_examples": [], "low_examples": []}
+
+            component_vector = self.pca.components_[component_idx]
+            projections = self.embeddings @ component_vector
+
+            order = np.argsort(projections)
+            n = min(n_examples, len(order) // 2) if len(order) >= 2 else 0
+            if n == 0:
+                return {"high_keywords": [], "low_keywords": [], "high_examples": [], "low_examples": []}
+
+            high_idx = order[-n:][::-1]
+            low_idx = order[:n]
+
+            titles = self.df["title"].fillna("").tolist()
+            high_captions = [titles[i] for i in high_idx]
+            low_captions = [titles[i] for i in low_idx]
+
+            def _top_keywords(captions: List[str]) -> List[str]:
+                non_empty = [c for c in captions if len(c.strip()) > 2]
+                if len(non_empty) < 2:
+                    return []
+                try:
+                    tfidf = TfidfVectorizer(max_features=n_keywords, stop_words="english",
+                                             token_pattern=r"(?u)\b[#\w][\w]{2,}\b")
+                    tfidf.fit(non_empty)
+                    return list(tfidf.get_feature_names_out())
+                except Exception:
+                    return []
+
+            return {
+                "high_keywords": _top_keywords(high_captions),
+                "low_keywords": _top_keywords(low_captions),
+                "high_examples": [str(c)[:80] for c in high_captions[:3]],
+                "low_examples": [str(c)[:80] for c in low_captions[:3]],
+            }
+        except Exception as e:
+            logger.warning("Failed to explain embedding component %s: %s", component_idx, e)
+            return {"high_keywords": [], "low_keywords": [], "high_examples": [], "low_examples": []}
 
     # 3. CONTENT CLUSTERING (KMeans — the "niche-performance-tier" clustering,
     # distinct from topic_discovery's semantic clustering, #11 below)
@@ -597,11 +667,23 @@ class MLEngine:
                     contribution = actual_pred - baseline_pred
                     if abs(contribution) > 0.001:
                         readable = readable_names.get(feat_name, feat_name.replace("is_", "").replace("_", " ").title())
-                        contributions.append({
+                        entry = {
                             "feature": readable, "value": float(X[idx][i]),
                             "contribution_pct": round(float(contribution * 100), 1),
                             "direction": "positive" if contribution > 0 else "negative",
-                        })
+                        }
+                        # Same interpretability fix as #2's feature_importance:
+                        # tell the reader WHAT this post's caption looked like
+                        # relative to the axis, not just an opaque emb_N value.
+                        if feat_name.startswith("emb_"):
+                            component_idx = int(feat_name.split("_")[1])
+                            axis = self._explain_embedding_component(component_idx)
+                            side = "high" if entry["value"] >= 0 else "low"
+                            entry["interpretation"] = {
+                                "this_post_is_on_the": side,
+                                "keywords_on_this_side": axis.get(f"{side}_keywords", []),
+                            }
+                        contributions.append(entry)
                 contributions.sort(key=lambda x: abs(x["contribution_pct"]), reverse=True)
                 return contributions[:5]
 
