@@ -136,6 +136,7 @@ def test_fetch_training_rows_returns_annotation_and_ratio_pairs_for_a_niche(fake
         assert "shot_breakdown" in annotation
         assert "full_transcript" in annotation
         assert "video_duration_seconds" in annotation
+        assert "hook_text" in annotation
         assert isinstance(ratio, float)
 
 

@@ -37,7 +37,7 @@ def _fetch_candidate_items(niche: str) -> list[dict]:
             cur.execute(
                 """SELECT eci.id, eci.duration_seconds,
                           ecd.hook_type, ecd.format_tag, ecd.energy_level,
-                          ecd.shot_breakdown, ecd.full_transcript
+                          ecd.shot_breakdown, ecd.full_transcript, ecd.hook_text
                    FROM external_content_items eci
                    JOIN watched_accounts wa ON wa.id = eci.watched_account_id
                    JOIN external_creative_dna ecd ON ecd.external_content_item_id = eci.id
@@ -53,6 +53,7 @@ def _fetch_candidate_items(niche: str) -> list[dict]:
                     "energy_level": row[4],
                     "shot_breakdown": row[5] or [],
                     "full_transcript": row[6] or [],
+                    "hook_text": row[7],
                 }
                 for row in cur.fetchall()
             ]
@@ -90,6 +91,7 @@ def fetch_training_rows(niche: str) -> list[tuple[dict, float]]:
             "shot_breakdown": c["shot_breakdown"],
             "full_transcript": c["full_transcript"],
             "video_duration_seconds": c["video_duration_seconds"],
+            "hook_text": c["hook_text"],
         }
         rows.append((annotation, float(perf["ratio_to_median"])))
 
