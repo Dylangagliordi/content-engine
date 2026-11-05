@@ -308,3 +308,124 @@ def test_feature_importance_uses_metadata_contrast_for_visual_not_tfidf():
         assert "interpretation" in f
         assert "setting" in f["interpretation"]
         assert "high_mode" in f["interpretation"]["setting"]
+
+
+# ──────────────────────────────────────────────
+# Real correlation + full feature listing — user: "does it tell us how
+# correlated? how can we have that... also do it for every feature,
+# also list every feature". feature_importance() previously only gave
+# sklearn's Gini/variance-reduction importance (how much the model
+# RELIES on a feature), which is NOT a correlation and carries no sign.
+# This adds a real Spearman correlation (direction-aware) for every
+# continuous/ordinal/embedding feature, and a category-breakdown (the
+# categorical equivalent of a correlation sign) for hook_type/format_tag,
+# and changes the default to return EVERY feature, not just top_n.
+# ──────────────────────────────────────────────
+
+def test_feature_importance_lists_every_feature_by_default():
+    """top_n=None (the new default) must return every feature in the
+    model, not just the top 10 — real gap: 'also list every feature'."""
+    from qualume.learn.prediction import feature_importance
+    rows = [(_annotation(energy_level=i % 5 + 1), float(i % 5 + 1)) for i in range(25)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    total_features = (len(trained["categorical_keys"]) + len(trained["continuous_keys"])
+                       + len(trained["ordinal_keys"]) + len(trained["emb_keys"]))
+    result = feature_importance(trained)
+    assert len(result) == total_features
+
+
+def test_feature_importance_still_respects_explicit_top_n():
+    from qualume.learn.prediction import feature_importance
+    rows = [(_annotation(energy_level=i % 5 + 1), float(i % 5 + 1)) for i in range(25)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained, top_n=3)
+    assert len(result) == 3
+
+
+def test_feature_importance_includes_real_spearman_correlation_for_continuous_features():
+    """Known injected signal: cuts_per_min strongly correlated with the
+    target (same relationship test_train_predictor_and_predict_round_trip_on_synthetic_data
+    already proves the MODEL learns) — feature_importance must report
+    the actual correlation coefficient and a direction string, not just
+    an importance weight with no sign."""
+    from qualume.learn.prediction import feature_importance
+    rows = []
+    for i in range(30):
+        is_fast = i % 2 == 0
+        shots = [_shot(s, s + (1 if is_fast else 10)) for s in range(0, 20, 1 if is_fast else 10)]
+        ann = _annotation(shots=shots, duration=20)
+        ratio = 2.0 if is_fast else 0.5
+        rows.append((ann, ratio))
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained)
+    cuts = next(f for f in result if f["raw_feature"] == "cuts_per_min")
+    assert cuts["correlation"] is not None
+    assert cuts["correlation"] > 0  # more cuts/min -> higher ratio, by construction
+    assert cuts["direction"] == "higher is better"
+
+
+def test_feature_importance_direction_says_lower_is_better_for_negative_correlation():
+    from qualume.learn.prediction import feature_importance
+    rows = []
+    for i in range(30):
+        is_slow = i % 2 == 0
+        shots = [_shot(s, s + (10 if is_slow else 1)) for s in range(0, 20, 10 if is_slow else 1)]
+        ann = _annotation(shots=shots, duration=20)
+        ratio = 2.0 if is_slow else 0.5  # slower (fewer cuts) -> higher ratio here
+        rows.append((ann, ratio))
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained)
+    cuts = next(f for f in result if f["raw_feature"] == "cuts_per_min")
+    assert cuts["correlation"] < 0
+    assert cuts["direction"] == "lower is better"
+
+
+def test_feature_importance_includes_correlation_for_embedding_features():
+    """Embedding axes also get a real correlation number (on top of the
+    existing keyword/metadata interpretation) — same "how correlated"
+    answer applies to emb_* features, not just engineered ones."""
+    from qualume.learn.prediction import feature_importance
+    rows = [(_annotation_with_stored_embeddings(i, "cooking" if i % 2 == 0 else "fitness"),
+              2.0 if i % 2 == 0 else 0.5) for i in range(30)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained)
+    emb_features = [f for f in result if f["raw_feature"].startswith("emb_")]
+    assert len(emb_features) > 0
+    for f in emb_features:
+        assert "correlation" in f
+        assert "direction" in f
+
+
+def test_feature_importance_includes_category_breakdown_for_categorical_features():
+    """Categorical features (hook_type, format_tag) have no single
+    correlation number — the real equivalent is a per-category
+    breakdown of the actual target values, sorted so the best/worst
+    category is obvious, same directionality info a correlation sign
+    gives for continuous features."""
+    from qualume.learn.prediction import feature_importance
+    rows = []
+    for i in range(30):
+        hook = "question" if i % 2 == 0 else "statement"
+        ratio = 3.0 if hook == "question" else 0.5  # real injected signal
+        rows.append((_annotation(hook_type=hook, energy_level=i % 5 + 1), ratio))
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained)
+    hook_feature = next(f for f in result if f["raw_feature"] == "hook_type")
+    assert "category_breakdown" in hook_feature
+    breakdown = hook_feature["category_breakdown"]
+    values_by_category = {b["value"]: b["median_target"] for b in breakdown}
+    assert values_by_category["question"] > values_by_category["statement"]
+
+
+def test_feature_importance_correlation_is_none_when_insufficient_real_data():
+    """A feature with no real variance (e.g. every row has the same
+    energy_level, or an embedding block that never got fit) can't
+    produce a meaningful correlation — must report None, not a
+    fabricated/NaN-masquerading-as-zero number."""
+    from qualume.learn.prediction import feature_importance
+    rows = [(_annotation(energy_level=3), float(i)) for i in range(25)]  # energy_level constant
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    result = feature_importance(trained)
+    energy = next(f for f in result if f["raw_feature"] == "energy_level")
+    assert energy["correlation"] is None
+    assert energy["direction"] == "no variance / insufficient data"

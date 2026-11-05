@@ -268,6 +268,12 @@ def train_predictor(rows: list[tuple[dict, float]], min_sample_size: int = 50,
         "use_text_embeddings": text_embedder is not None,
         "use_transcript_embeddings": transcript_embedder is not None,
         "use_visual_embeddings": visual_embedder is not None,
+        # Kept for feature_importance()'s real correlation/category-breakdown
+        # computation (needs the actual per-row feature values + targets,
+        # not just the fitted model) — NOT used by predict_performance,
+        # which only ever needs "model"/"encoder"/the *_keys lists.
+        "_training_vectors": vectors,
+        "_training_targets": targets,
     }
 
 
@@ -321,34 +327,107 @@ def predict_performance_for_annotation(trained: dict, annotation: dict) -> float
     return predict_performance(trained, vec)
 
 
-def feature_importance(trained: dict, top_n: int = 10) -> list[dict]:
+def feature_importance(trained: dict, top_n: int | None = None) -> list[dict]:
     """Ranked feature importances from a trained model's RandomForestRegressor
     — real gap this closes (user: "whats the point of [embeddings] if we
     cant see them", extended to "how can we use all [text/transcript/
-    visual embeddings] ... and have them all be interpretable"): any
-    emb_* feature in the ranking gets a real human-readable interpretation
-    attached, with the RIGHT technique per source:
-      - emb_hook_* / emb_transcript_*: TF-IDF high/low keyword contrast
-        from real text (hook_text, or the exact text embedded into the
-        stored transcript vector) — text_embedding_features.explain_component
-        / stored_embedding_features.explain_transcript_component.
-      - emb_visual_*: structured shot-metadata (setting/shot_type/
-        color_temperature) mode contrast — visual embeddings have no
-        associated text at all, so TF-IDF cannot apply; see
-        stored_embedding_features.explain_visual_component.
-    Never left as an opaque PCA label.
+    visual embeddings] ... and have them all be interpretable", then
+    extended again: "does it tell us how correlated? how can we have
+    that... also do it for every feature, also list every feature"):
+
+    1. CORRELATION, not just importance. RandomForest's
+       feature_importances_ (Gini/variance-reduction) tells you how much
+       the MODEL RELIES on a feature — it has no sign and is not a
+       correlation coefficient. Every continuous/ordinal/embedding
+       feature now also gets a real Spearman rank correlation against
+       the actual training targets (ratio_to_median), plus a plain-
+       English "direction" string ("higher is better" / "lower is
+       better" / "no variance / insufficient data"). Spearman, not
+       Pearson, chosen for the same reason learn.mining already uses
+       Mann-Whitney U elsewhere in this codebase: ratio_to_median is a
+       skewed ratio metric with real outliers (documented repeatedly
+       this project — fitness max=355x median), and Spearman makes no
+       normality/linearity assumption, just monotonic rank agreement.
+       None (not a fabricated 0.0) when there's no real variance to
+       correlate (e.g. every training row had the same value for that
+       feature) — same "refuse rather than guess" discipline as
+       baseline.py/mining.py.
+    2. CATEGORY BREAKDOWN for categorical features (hook_type,
+       format_tag). A single correlation number has no meaning for an
+       unordered category — the real equivalent is each distinct
+       value's median target (ratio_to_median) across the real training
+       rows that had it, sorted descending, so "which category is
+       actually associated with higher performance" is directly
+       readable (the categorical analogue of a correlation sign).
+    3. EVERY emb_* feature in the ranking gets a real human-readable
+       interpretation attached, with the RIGHT technique per source:
+       emb_hook_*/emb_transcript_* via TF-IDF high/low keyword contrast;
+       emb_visual_* via structured shot-metadata mode contrast (no
+       associated text exists for visual embeddings). Never left as an
+       opaque PCA label.
+    4. top_n=None (the new default) returns EVERY feature in the model,
+       not just the top few — pass an explicit top_n to cap the list.
 
     Returns a list of {feature, raw_feature, importance, pct} dicts,
-    sorted descending by importance, optionally with an "interpretation"
-    key for emb_* features. Does not filter by a minimum importance
-    threshold (unlike okn_mirror's >0.01 cutoff) — top_n caps the list
-    length instead, since this is meant for direct inspection, not a
-    report section."""
+    sorted descending by importance, each also carrying either
+    "correlation"+"direction" (continuous/ordinal/embedding features) or
+    "category_breakdown" (categorical features), plus "interpretation"
+    for emb_* features."""
+    import numpy as np
+    from scipy import stats
+
     model = trained["model"]
-    feature_names = (trained["categorical_keys"] + trained["continuous_keys"]
-                      + trained["ordinal_keys"] + trained.get("emb_keys", []))
+    categorical_keys = trained["categorical_keys"]
+    continuous_keys = trained["continuous_keys"]
+    ordinal_keys = trained["ordinal_keys"]
+    emb_keys = trained.get("emb_keys", [])
+    feature_names = categorical_keys + continuous_keys + ordinal_keys + emb_keys
     importances = model.feature_importances_
-    ranked = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)[:top_n]
+    ranked = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
+    if top_n is not None:
+        ranked = ranked[:top_n]
+
+    targets = trained.get("_training_targets")
+    training_vectors = trained.get("_training_vectors")
+
+    def _spearman_correlation(name: str):
+        """Real Spearman rho between one feature's real training values
+        and the real training targets. None if fewer than 2 distinct
+        real (non-None) values exist for this feature — scipy.stats.spearmanr
+        on constant input returns NaN, which this deliberately converts to
+        None rather than letting a silent NaN leak into output that looks
+        like a real number."""
+        if targets is None or training_vectors is None:
+            return None
+        values, matched_targets = [], []
+        for v, t in zip(training_vectors, targets):
+            val = v.get(name)
+            if val is not None:
+                values.append(val)
+                matched_targets.append(t)
+        if len(set(values)) < 2 or len(values) < 3:
+            return None
+        rho, _ = stats.spearmanr(values, matched_targets)
+        if np.isnan(rho):
+            return None
+        return float(rho)
+
+    def _category_breakdown(name: str) -> list[dict]:
+        """Median real target per distinct real category value, sorted
+        descending — the categorical equivalent of a correlation sign."""
+        if targets is None or training_vectors is None:
+            return []
+        by_value: dict = {}
+        for v, t in zip(training_vectors, targets):
+            val = v.get(name)
+            if val is not None:
+                by_value.setdefault(val, []).append(t)
+        breakdown = [
+            {"value": val, "n": len(ts), "median_target": float(np.median(ts))}
+            for val, ts in by_value.items()
+        ]
+        breakdown.sort(key=lambda b: b["median_target"], reverse=True)
+        return breakdown
 
     results = []
     for name, imp in ranked:
@@ -358,6 +437,20 @@ def feature_importance(trained: dict, top_n: int = 10) -> list[dict]:
             "importance": round(float(imp), 4),
             "pct": round(float(imp) * 100, 1),
         }
+        if name in categorical_keys:
+            entry["category_breakdown"] = _category_breakdown(name)
+        else:
+            rho = _spearman_correlation(name)
+            entry["correlation"] = round(rho, 4) if rho is not None else None
+            if rho is None:
+                entry["direction"] = "no variance / insufficient data"
+            elif rho > 0:
+                entry["direction"] = "higher is better"
+            elif rho < 0:
+                entry["direction"] = "lower is better"
+            else:
+                entry["direction"] = "no clear direction"
+
         if name.startswith("emb_hook_") and trained.get("text_embedder") is not None:
             component_idx = int(name.split("_")[-1])
             entry["interpretation"] = explain_component(trained["text_embedder"], component_idx)
