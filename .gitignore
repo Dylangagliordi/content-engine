@@ -10,3 +10,4 @@ logs/
 data/ingestion_progress.log
 data/okn_mirror_results.json
 data/okn_vs_qualume_comparison.json
+data/models/
