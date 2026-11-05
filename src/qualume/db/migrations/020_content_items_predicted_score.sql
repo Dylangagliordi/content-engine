@@ -1,0 +1,31 @@
+-- content_items.predicted_score: real-number point estimate from
+-- learn.prediction.predict_performance_for_annotation (a trained
+-- RandomForestRegressor's prediction of ratio_to_median performance for
+-- this draft), persisted at generation time so it's visible on the row
+-- without re-running the model. NULLABLE, not a fabricated default: a
+-- draft generated for a niche with no saved model yet (below the
+-- 50-row training floor, or never trained via
+-- scripts/train_and_save_all_predictors.py) gets NULL, never a made-up
+-- number — same honest-gap discipline as content_type (migration 017)
+-- being NULL for "not yet classified" rather than defaulting to
+-- whichever value happens to be numerically dominant.
+--
+-- content_items.niche: which real niche this draft was generated for,
+-- needed to even KNOW which saved per-niche model (if any) to score it
+-- against — learn.prediction/learn.model_persistence are niche-scoped
+-- throughout (same reasoning as every other niche-scoped module this
+-- session: pooling across niches would make a performance comparison
+-- meaningless). Nullable: existing rows generated before this migration
+-- have no niche recorded, and a batch run without an explicit --niche
+-- argument (run_batch.py's new optional parameter) is a real, valid
+-- case too (e.g. local testing) that should not be scored/gated, not
+-- silently fabricated into some default niche.
+--
+-- Added 2026-11-04, real fix for the gap surfaced when the user asked
+-- "is it fully built and merged and using every model" — the trained
+-- prediction model existed but was never actually called anywhere in
+-- the real Write->Design->persist pipeline (run_batch.py). This column
+-- is what makes that score durable/visible once run_batch.py is wired
+-- to call predict_performance_for_annotation (same commit).
+ALTER TABLE content_items ADD COLUMN predicted_score DOUBLE PRECISION;
+ALTER TABLE content_items ADD COLUMN niche TEXT;
