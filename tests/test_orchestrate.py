@@ -225,6 +225,7 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
          patch("qualume.orchestrate.find_pending_annotation") as mock_find_ann, \
          patch("qualume.orchestrate.find_pending_classification") as mock_find_cls, \
          patch("qualume.orchestrate.find_pending_content_type_classification") as mock_find_ctype, \
+         patch("qualume.orchestrate.list_distinct_niches") as mock_niches, \
          patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
          patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
          patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
@@ -237,6 +238,7 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
         mock_classify.side_effect = ["copy-a", "copy-b"]
         mock_find_ctype.return_value = ["item-a", "item-b"]
         mock_classify_ctype.side_effect = ["item-a", "item-b"]
+        mock_niches.return_value = ["fitness/workout content"]
         mock_mining.return_value = {
             "tested": 5, "proposed_or_refreshed": 2,
             "skipped_not_significant": 3, "retired": 0, "errors": [],
@@ -260,22 +262,32 @@ def test_run_ingestion_cycle_chains_all_six_stages_and_reports_each(fake_account
     assert result["classification"]["failed"] == 0
     assert result["content_type_classification"]["succeeded"] == 2
     assert result["content_type_classification"]["failed"] == 0
-    assert result["mining"] == mock_mining.return_value
-    mock_mining.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
-    assert result["clustering"] == mock_cluster.return_value
-    mock_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
-    assert result["visual_clustering"] == mock_visual_cluster.return_value
-    mock_visual_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
+    # NICHE-SCOPED shape (real fix, 2026-11-04): each pass is now called
+    # ONCE PER REAL NICHE, not once unscoped across all niches pooled.
+    assert result["mining"]["niches_processed"] == 1
+    assert result["mining"]["by_niche"]["fitness/workout content"] == mock_mining.return_value
+    mock_mining.assert_called_once_with(applies_to_workflow_type="tiktok_reels", niche="fitness/workout content")
+    assert result["clustering"]["niches_processed"] == 1
+    assert result["clustering"]["by_niche"]["fitness/workout content"] == mock_cluster.return_value
+    mock_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels", niche="fitness/workout content")
+    assert result["visual_clustering"]["niches_processed"] == 1
+    assert result["visual_clustering"]["by_niche"]["fitness/workout content"] == mock_visual_cluster.return_value
+    mock_visual_cluster.assert_called_once_with(
+        applies_to_workflow_type="tiktok_reels", niche="fitness/workout content"
+    )
 
 
 def test_run_ingestion_cycle_isolates_a_whole_mining_stage_failure():
     """A mining-pass failure (e.g. a transient DB hiccup across the whole
     stage) must not be fatal to the cycle's result — same whole-stage
-    isolation discipline as poll/download/annotation/classification."""
+    isolation discipline as poll/download/annotation/classification.
+    NICHE-SCOPED shape: isolation now happens PER NICHE inside
+    mining['by_niche'], not as a single top-level mining['error']."""
     with patch("qualume.orchestrate.run_poll_cycle") as mock_poll, \
          patch("qualume.orchestrate.download_pending_videos") as mock_download, \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=["fitness/workout content"]), \
          patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
          patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
          patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
@@ -286,8 +298,8 @@ def test_run_ingestion_cycle_isolates_a_whole_mining_stage_failure():
 
         result = run_ingestion_cycle()
 
-    assert result["mining"]["error"] is not None
-    assert "simulated mining failure" in result["mining"]["error"]
+    assert result["mining"]["by_niche"]["fitness/workout content"]["error"] is not None
+    assert "simulated mining failure" in result["mining"]["by_niche"]["fitness/workout content"]["error"]
 
 
 def test_run_ingestion_cycle_calls_cluster_pass_as_its_6th_stage():
@@ -295,6 +307,7 @@ def test_run_ingestion_cycle_calls_cluster_pass_as_its_6th_stage():
          patch("qualume.orchestrate.download_pending_videos", return_value={}), \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=["fitness/workout content"]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
          patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
@@ -306,8 +319,8 @@ def test_run_ingestion_cycle_calls_cluster_pass_as_its_6th_stage():
 
         result = run_ingestion_cycle()
 
-    assert result["clustering"] == mock_cluster.return_value
-    mock_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
+    assert result["clustering"]["by_niche"]["fitness/workout content"] == mock_cluster.return_value
+    mock_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels", niche="fitness/workout content")
 
 
 def test_run_ingestion_cycle_isolates_a_whole_clustering_stage_failure():
@@ -315,6 +328,7 @@ def test_run_ingestion_cycle_isolates_a_whole_clustering_stage_failure():
          patch("qualume.orchestrate.download_pending_videos", return_value={}), \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=["fitness/workout content"]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass") as mock_cluster, \
          patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
@@ -323,8 +337,8 @@ def test_run_ingestion_cycle_isolates_a_whole_clustering_stage_failure():
 
         result = run_ingestion_cycle()
 
-    assert result["clustering"]["error"] is not None
-    assert "simulated Voyage outage" in result["clustering"]["error"]
+    assert result["clustering"]["by_niche"]["fitness/workout content"]["error"] is not None
+    assert "simulated Voyage outage" in result["clustering"]["by_niche"]["fitness/workout content"]["error"]
 
 
 def test_run_ingestion_cycle_calls_visual_cluster_pass_as_its_7th_stage():
@@ -332,6 +346,7 @@ def test_run_ingestion_cycle_calls_visual_cluster_pass_as_its_7th_stage():
          patch("qualume.orchestrate.download_pending_videos", return_value={}), \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=["fitness/workout content"]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
          patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
@@ -343,8 +358,10 @@ def test_run_ingestion_cycle_calls_visual_cluster_pass_as_its_7th_stage():
 
         result = run_ingestion_cycle()
 
-    assert result["visual_clustering"] == mock_visual_cluster.return_value
-    mock_visual_cluster.assert_called_once_with(applies_to_workflow_type="tiktok_reels")
+    assert result["visual_clustering"]["by_niche"]["fitness/workout content"] == mock_visual_cluster.return_value
+    mock_visual_cluster.assert_called_once_with(
+        applies_to_workflow_type="tiktok_reels", niche="fitness/workout content"
+    )
 
 
 def test_run_ingestion_cycle_isolates_a_whole_visual_clustering_stage_failure():
@@ -352,6 +369,7 @@ def test_run_ingestion_cycle_isolates_a_whole_visual_clustering_stage_failure():
          patch("qualume.orchestrate.download_pending_videos", return_value={}), \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=["fitness/workout content"]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
          patch("qualume.orchestrate.run_visual_cluster_pass") as mock_visual_cluster:
@@ -360,8 +378,37 @@ def test_run_ingestion_cycle_isolates_a_whole_visual_clustering_stage_failure():
 
         result = run_ingestion_cycle()
 
-    assert result["visual_clustering"]["error"] is not None
-    assert "simulated Voyage multimodal outage" in result["visual_clustering"]["error"]
+    assert result["visual_clustering"]["by_niche"]["fitness/workout content"]["error"] is not None
+    assert "simulated Voyage multimodal outage" in result["visual_clustering"]["by_niche"]["fitness/workout content"]["error"]
+
+
+def test_run_ingestion_cycle_processes_multiple_real_niches_independently():
+    """Real multi-niche shape: with 2+ real niches present, each gets its
+    OWN scoped call — one niche's result/failure must not affect another's,
+    same per-item isolation discipline as annotation/classification."""
+    with patch("qualume.orchestrate.run_poll_cycle", return_value={}), \
+         patch("qualume.orchestrate.download_pending_videos", return_value={}), \
+         patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
+         patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches",
+               return_value=["fitness/workout content", "food/cooking/recipe content"]), \
+         patch("qualume.orchestrate.run_mining_pass") as mock_mining, \
+         patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
+
+        def mining_side_effect(applies_to_workflow_type, niche):
+            if niche == "fitness/workout content":
+                raise RuntimeError("fitness mining failed")
+            return {"tested": 3, "proposed_or_refreshed": 1}
+        mock_mining.side_effect = mining_side_effect
+
+        result = run_ingestion_cycle()
+
+    assert result["mining"]["niches_processed"] == 2
+    assert "error" in result["mining"]["by_niche"]["fitness/workout content"]
+    assert result["mining"]["by_niche"]["food/cooking/recipe content"] == {
+        "tested": 3, "proposed_or_refreshed": 1,
+    }
 
 
 def test_run_ingestion_cycle_isolates_one_annotation_failure_from_others(fake_account):

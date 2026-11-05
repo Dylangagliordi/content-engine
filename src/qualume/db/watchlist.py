@@ -70,3 +70,35 @@ def deactivate_watched_account(account_id: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def list_distinct_niches(active_only: bool = True) -> list[str]:
+    """Every distinct real niche string currently present in
+    watched_accounts (NULL/not-yet-classified niches excluded — there's
+    no real niche-scoped mining/clustering to run for an account that
+    hasn't been classified yet).
+
+    Added for orchestrate.run_ingestion_cycle's real fix (2026-11-04):
+    mining/clustering/visual_clustering were calling run_mining_pass/
+    run_cluster_pass/run_visual_cluster_pass UNSCOPED (niche=None) despite
+    those functions' own niche parameter existing since 2026-11-02
+    specifically so the live orchestrator could loop per-niche — this was
+    flagged as a real, unfixed gap for two sessions. This function is
+    what the orchestrator now loops over instead of calling each pass
+    once, unscoped, across all niches pooled together.
+
+    active_only=True (default) matches list_watched_accounts' own
+    default — an inactive/deactivated account's niche shouldn't trigger
+    a mining/clustering pass for a niche nobody is actively tracking
+    anymore, though its already-ingested data still counts toward that
+    niche's sample size via whatever query each pass itself runs."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            query = "SELECT DISTINCT niche FROM watched_accounts WHERE niche IS NOT NULL"
+            if active_only:
+                query += " AND active = true"
+            cur.execute(query)
+            return sorted(row[0] for row in cur.fetchall())
+    finally:
+        conn.close()

@@ -134,3 +134,47 @@ def test_add_watched_account_persists_explicit_niche():
         assert match[0]["niche"] == "women's health supplements"
     finally:
         _cleanup(handle)
+
+
+def test_list_distinct_niches_returns_only_real_niches_no_duplicates(monkeypatch=None):
+    """Real gap closed 2026-11-04: orchestrate.run_ingestion_cycle needs
+    this to loop mining/clustering per-niche instead of calling each pass
+    once unscoped. Two accounts sharing a niche must appear ONCE, not
+    twice; a NULL niche must never appear at all."""
+    from qualume.db.watchlist import list_distinct_niches
+
+    a = f"test_niches_a_{uuid.uuid4().hex[:8]}"
+    b = f"test_niches_b_{uuid.uuid4().hex[:8]}"
+    c = f"test_niches_c_{uuid.uuid4().hex[:8]}"
+    niche = f"zz_test_shared_niche_{uuid.uuid4().hex[:8]}"
+    _cleanup(a)
+    _cleanup(b)
+    _cleanup(c)
+    try:
+        add_watched_account("tiktok", a, niche=niche)
+        add_watched_account("tiktok", b, niche=niche)  # same niche, different account
+        add_watched_account("tiktok", c, niche=None)   # not yet classified
+
+        niches = list_distinct_niches(active_only=True)
+        assert niches.count(niche) == 1
+        assert None not in niches
+    finally:
+        _cleanup(a)
+        _cleanup(b)
+        _cleanup(c)
+
+
+def test_list_distinct_niches_respects_active_only():
+    from qualume.db.watchlist import list_distinct_niches
+
+    handle = f"test_niches_inactive_{uuid.uuid4().hex[:8]}"
+    niche = f"zz_test_inactive_niche_{uuid.uuid4().hex[:8]}"
+    _cleanup(handle)
+    try:
+        account_id = add_watched_account("tiktok", handle, niche=niche)
+        deactivate_watched_account(account_id)
+
+        assert niche not in list_distinct_niches(active_only=True)
+        assert niche in list_distinct_niches(active_only=False)
+    finally:
+        _cleanup(handle)

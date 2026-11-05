@@ -20,6 +20,7 @@ from qualume.annotate.content_type_classifier import classify_and_store_content_
 from qualume.annotate.copy_classifier import classify_and_store_external
 from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALYSIS_PROMPT_VERSION
 from qualume.annotate.gemini_watcher import annotate_and_store
+from qualume.db.watchlist import list_distinct_niches
 from qualume.ingest.tiktok_reader import download_pending_videos
 from qualume.learn.run_cluster_pass import run_cluster_pass
 from qualume.learn.run_mining_pass import run_mining_pass
@@ -313,17 +314,51 @@ def run_ingestion_cycle() -> dict:
         # not read from anywhere dynamic, same as run_batch.py's own
         # workflow_type handling; becomes a real parameter the day a
         # second external-reading workflow (e.g. Instagram) exists.
-        result["mining"] = run_mining_pass(applies_to_workflow_type="tiktok_reels")
+        #
+        # NICHE-SCOPED LOOP — real fix (2026-11-04) for a real, flagged-
+        # but-unfixed gap: run_mining_pass has accepted an optional niche
+        # parameter since 2026-11-02 specifically so the live orchestrator
+        # could stop pooling all niches (65 and growing — women's health,
+        # religion/philosophy, fitness, food...) into one unscoped pass,
+        # but this call sat unscoped (niche=None) for two sessions anyway.
+        # Loops over every real niche in watched_accounts
+        # (db.watchlist.list_distinct_niches) and runs one scoped pass per
+        # niche — same per-item isolation discipline as every other stage
+        # in this cycle (one niche's failure doesn't block the rest).
+        # Each niche's result is reported separately so a specific niche's
+        # mining failure (e.g. a sample-floor miss) is visible, not
+        # averaged away into one opaque pooled number.
+        niches = list_distinct_niches()
+        mining_by_niche: dict = {}
+        for niche in niches:
+            try:
+                mining_by_niche[niche] = run_mining_pass(
+                    applies_to_workflow_type="tiktok_reels", niche=niche
+                )
+            except Exception as e:
+                mining_by_niche[niche] = {"error": f"{type(e).__name__}: {e}"}
+        result["mining"] = {"niches_processed": len(niches), "by_niche": mining_by_niche}
     except Exception as e:
         result["mining"] = {"error": f"{type(e).__name__}: {e}"}
 
     try:
         # Phase B (clustering) — 6th stage, added 2026-10-30. Same
-        # tiktok_reels hardcode as the mining stage above, same reasoning.
-        # Runs independently of the mining stage (Phase A/declared-
-        # taxonomy) — a Voyage outage or embedding failure here must not
-        # block the already-proven mining pass, and vice versa.
-        result["clustering"] = run_cluster_pass(applies_to_workflow_type="tiktok_reels")
+        # tiktok_reels hardcode and NICHE-SCOPED LOOP as the mining stage
+        # above, same real-fix reasoning (run_cluster_pass has accepted
+        # niche since 2026-11-02; this call sat unscoped for two
+        # sessions). Runs independently of the mining stage (Phase A/
+        # declared-taxonomy) — a Voyage outage or embedding failure here
+        # must not block the already-proven mining pass, and vice versa.
+        niches = list_distinct_niches()
+        clustering_by_niche: dict = {}
+        for niche in niches:
+            try:
+                clustering_by_niche[niche] = run_cluster_pass(
+                    applies_to_workflow_type="tiktok_reels", niche=niche
+                )
+            except Exception as e:
+                clustering_by_niche[niche] = {"error": f"{type(e).__name__}: {e}"}
+        result["clustering"] = {"niches_processed": len(niches), "by_niche": clustering_by_niche}
     except Exception as e:
         result["clustering"] = {"error": f"{type(e).__name__}: {e}"}
 
@@ -333,10 +368,22 @@ def run_ingestion_cycle() -> dict:
         # along with our transcript embedding"). Kept as a SEPARATE
         # stage/pass from the transcript clustering above, not fused —
         # the user explicitly wants to compare real cluster quality from
-        # each side independently before any fusion decision. A Voyage
+        # each side independently before any fusion decision. Same
+        # NICHE-SCOPED LOOP real fix as mining/clustering above. A Voyage
         # multimodal outage or frame-extraction failure here must not
         # block transcript clustering or mining, and vice versa.
-        result["visual_clustering"] = run_visual_cluster_pass(applies_to_workflow_type="tiktok_reels")
+        niches = list_distinct_niches()
+        visual_clustering_by_niche: dict = {}
+        for niche in niches:
+            try:
+                visual_clustering_by_niche[niche] = run_visual_cluster_pass(
+                    applies_to_workflow_type="tiktok_reels", niche=niche
+                )
+            except Exception as e:
+                visual_clustering_by_niche[niche] = {"error": f"{type(e).__name__}: {e}"}
+        result["visual_clustering"] = {
+            "niches_processed": len(niches), "by_niche": visual_clustering_by_niche,
+        }
     except Exception as e:
         result["visual_clustering"] = {"error": f"{type(e).__name__}: {e}"}
 
