@@ -26,6 +26,18 @@ def _cleanup_account(handle: str):
     try:
         with conn.cursor() as cur:
             cur.execute(
+                "DELETE FROM transcript_embeddings WHERE external_content_item_id IN "
+                "(SELECT id FROM external_content_items WHERE watched_account_id IN "
+                "(SELECT id FROM watched_accounts WHERE handle = %s))",
+                (handle,),
+            )
+            cur.execute(
+                "DELETE FROM visual_embeddings WHERE external_content_item_id IN "
+                "(SELECT id FROM external_content_items WHERE watched_account_id IN "
+                "(SELECT id FROM watched_accounts WHERE handle = %s))",
+                (handle,),
+            )
+            cur.execute(
                 "DELETE FROM external_performance_snapshots WHERE external_content_item_id IN "
                 "(SELECT id FROM external_content_items WHERE watched_account_id IN "
                 "(SELECT id FROM watched_accounts WHERE handle = %s))",
@@ -102,6 +114,38 @@ def _insert_snapshot(item_id, views):
         conn.close()
 
 
+def _insert_transcript_embedding(item_id, dim=1024):
+    import json
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO transcript_embeddings
+                   (external_content_item_id, embedding, source_text_hash, embedding_model)
+                   VALUES (%s, %s, 'fake_hash', 'voyage-3.5')""",
+                (item_id, json.dumps([0.1] * dim)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_visual_embedding(item_id, dim=1024):
+    import json
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO visual_embeddings
+                   (external_content_item_id, embedding, n_frames_used, embedding_model)
+                   VALUES (%s, %s, 6, 'voyage-multimodal-3.5')""",
+                (item_id, json.dumps([0.2] * dim)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def fake_niche():
     handle = f"zz_test_training_{uuid.uuid4().hex[:8]}"
@@ -170,3 +214,56 @@ def test_fetch_training_rows_skips_items_without_a_real_performance_baseline(fak
     rows = fetch_training_rows(niche="zz_test_training_niche")
 
     assert len(rows) == 6  # the unscored item is excluded, not crashing the fetch
+
+
+# ──────────────────────────────────────────────
+# Stored transcript/visual embedding fetching — added for the three-way
+# embedding merge ("how can we use all [text/transcript/visual
+# embeddings] in the prediction model").
+# ──────────────────────────────────────────────
+
+def test_fetch_training_rows_includes_stored_embedding_vectors_when_present(fake_niche):
+    account_id, items = fake_niche
+    for item_id in items:
+        _insert_transcript_embedding(item_id)
+        _insert_visual_embedding(item_id)
+
+    rows = fetch_training_rows(niche="zz_test_training_niche")
+    assert len(rows) == 6
+    for annotation, _ in rows:
+        assert annotation["transcript_embedding_vector"] is not None
+        assert len(annotation["transcript_embedding_vector"]) == 1024
+        assert annotation["visual_embedding_vector"] is not None
+        assert annotation["transcript_embeddable_text"] is not None
+
+
+def test_fetch_training_rows_gives_none_for_items_with_no_stored_embedding(fake_niche):
+    """Real, incomplete coverage: these embedding pipelines run
+    independently of annotation, on their own schedule — most annotated
+    items have NOT been through them. None, not a fabricated vector."""
+    account_id, items = fake_niche
+    # deliberately insert NO embeddings for any item
+
+    rows = fetch_training_rows(niche="zz_test_training_niche")
+    assert len(rows) == 6
+    for annotation, _ in rows:
+        assert annotation["transcript_embedding_vector"] is None
+        assert annotation["visual_embedding_vector"] is None
+        assert annotation["transcript_embeddable_text"] is None
+
+
+def test_fetch_training_rows_handles_partial_stored_embedding_coverage(fake_niche):
+    """Real shape: SOME items have one or both stored embeddings, others
+    don't — must not crash, and must get the real vector where it
+    exists, None elsewhere (never inferring from a different item)."""
+    account_id, items = fake_niche
+    _insert_transcript_embedding(items[0])
+    _insert_visual_embedding(items[1])
+    # items[2:] deliberately left with neither
+
+    rows = fetch_training_rows(niche="zz_test_training_niche")
+    assert len(rows) == 6
+    with_transcript = sum(1 for ann, _ in rows if ann["transcript_embedding_vector"] is not None)
+    with_visual = sum(1 for ann, _ in rows if ann["visual_embedding_vector"] is not None)
+    assert with_transcript == 1
+    assert with_visual == 1

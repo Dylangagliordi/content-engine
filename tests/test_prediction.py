@@ -200,3 +200,111 @@ def test_feature_importance_attaches_interpretation_to_emb_hook_features():
     emb_features = [f for f in importances if f["raw_feature"].startswith("emb_hook_")]
     for f in emb_features:
         assert "interpretation" in f
+
+
+# ──────────────────────────────────────────────
+# Three-way embedding merge: hook_text (live) + transcript/visual
+# (precomputed, learn.stored_embedding_features) — "how can we use ALL
+# [text/transcript/visual embeddings] in the prediction model and have
+# them all be interpretable".
+# ──────────────────────────────────────────────
+
+def _random_vector(seed: int, dim: int = 1024) -> list[float]:
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    return list(rng.rand(dim))
+
+
+def _annotation_with_stored_embeddings(i: int, topic: str):
+    ann = _annotation(energy_level=i % 5 + 1)
+    ann["hook_text"] = f"{topic} hook text number {i}"
+    ann["transcript_embedding_vector"] = _random_vector(i)
+    ann["transcript_embeddable_text"] = f"{topic} full transcript spoken words number {i}"
+    ann["visual_embedding_vector"] = _random_vector(1000 + i)
+    ann["shot_breakdown"] = [{"start_sec": 0, "end_sec": 10, "setting": topic, "shot_type": "medium_shot"}]
+    return ann
+
+
+def test_build_feature_vector_with_all_three_embedders_adds_all_three_blocks():
+    from qualume.learn.stored_embedding_features import fit_stored_embeddings
+    rows = [(_annotation_with_stored_embeddings(i, "cooking" if i % 2 == 0 else "fitness"), 1.0)
+            for i in range(20)]
+    transcript_embedder = fit_stored_embeddings(
+        [ann["transcript_embedding_vector"] for ann, _ in rows],
+        [ann["transcript_embeddable_text"] for ann, _ in rows],
+    )
+    visual_embedder = fit_stored_embeddings(
+        [ann["visual_embedding_vector"] for ann, _ in rows],
+        [{"setting": "x"}] * 20,
+    )
+    ann = rows[0][0]
+    vec = build_feature_vector(ann, transcript_embedder=transcript_embedder, visual_embedder=visual_embedder)
+    assert any(k.startswith("emb_transcript_") for k in vec)
+    assert any(k.startswith("emb_visual_") for k in vec)
+    assert not any(k.startswith("emb_hook_") for k in vec)  # text_embedder not passed
+
+
+def test_build_feature_vector_gives_none_for_missing_stored_vector():
+    """An item with NO stored transcript/visual embedding yet (real,
+    incomplete coverage) must get None for that block's features, not a
+    fabricated zero vector."""
+    from qualume.learn.stored_embedding_features import fit_stored_embeddings
+    vectors = [_random_vector(i) for i in range(20)]
+    embedder = fit_stored_embeddings(vectors, ["text"] * 20)
+    ann = _annotation()
+    ann["transcript_embedding_vector"] = None  # this item has no stored vector
+    vec = build_feature_vector(ann, transcript_embedder=embedder)
+    emb_keys = [k for k in vec if k.startswith("emb_transcript_")]
+    assert len(emb_keys) == embedder["n_components"]
+    assert all(vec[k] is None for k in emb_keys)
+
+
+def test_train_predictor_fits_transcript_and_visual_embedders_from_rows():
+    rows = [(_annotation_with_stored_embeddings(i, "cooking" if i % 2 == 0 else "fitness"), 1.0)
+            for i in range(30)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    assert trained["transcript_embedder"] is not None
+    assert trained["visual_embedder"] is not None
+    assert any(k.startswith("emb_transcript_") for k in trained["emb_keys"])
+    assert any(k.startswith("emb_visual_") for k in trained["emb_keys"])
+
+
+def test_train_predictor_skips_transcript_visual_when_disabled():
+    rows = [(_annotation_with_stored_embeddings(i, "x"), 1.0) for i in range(25)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False,
+                               use_transcript_embeddings=False, use_visual_embeddings=False)
+    assert trained["transcript_embedder"] is None
+    assert trained["visual_embedder"] is None
+    assert trained["emb_keys"] == []
+
+
+def test_train_predictor_handles_partial_coverage_gracefully():
+    """Real coverage shape: SOME items have a stored transcript/visual
+    vector, some don't (those pipelines run independently). The embedder
+    still fits on whichever rows DO have a vector, and the model trains
+    on the full row set with None for the rest — must not crash."""
+    rows = []
+    for i in range(30):
+        ann = _annotation_with_stored_embeddings(i, "cooking" if i % 2 == 0 else "fitness")
+        if i % 3 == 0:
+            ann["transcript_embedding_vector"] = None
+            ann["visual_embedding_vector"] = None
+        rows.append((ann, 1.0))
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    assert trained["transcript_embedder"] is not None  # enough real rows still had one
+
+
+def test_feature_importance_uses_metadata_contrast_for_visual_not_tfidf():
+    """Real gap this closes: visual embeddings have no associated text at
+    all, so feature_importance must use mode_contrast (structured
+    metadata), not an empty/broken TF-IDF attempt, for emb_visual_*."""
+    from qualume.learn.prediction import feature_importance
+    rows = [(_annotation_with_stored_embeddings(i, "cooking" if i % 2 == 0 else "fitness"),
+              2.0 if i % 2 == 0 else 0.5) for i in range(30)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    importances = feature_importance(trained, top_n=30)
+    visual_features = [f for f in importances if f["raw_feature"].startswith("emb_visual_")]
+    for f in visual_features:
+        assert "interpretation" in f
+        assert "setting" in f["interpretation"]
+        assert "high_mode" in f["interpretation"]["setting"]

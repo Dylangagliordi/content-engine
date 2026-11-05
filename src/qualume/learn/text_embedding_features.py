@@ -31,6 +31,8 @@ from typing import Optional
 
 import numpy as np
 
+from qualume.learn.embedding_interpretability import rank_high_low_indices, tfidf_keywords
+
 logger = logging.getLogger("qualume.learn.text_embedding_features")
 
 _embedding_model = None
@@ -109,37 +111,19 @@ def explain_component(fitted: dict, component_idx: int, n_examples: int = 5, n_k
     Returns {"high_keywords", "low_keywords", "high_examples", "low_examples"}
     — never raises, degrades to empty lists on any internal failure."""
     try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-
         component_vector = fitted["pca"].components_[component_idx]
-        projections = fitted["embeddings"] @ component_vector
         texts = fitted["texts"]
 
-        order = np.argsort(projections)
-        n = min(n_examples, len(order) // 2) if len(order) >= 2 else 0
-        if n == 0:
+        high_idx, low_idx = rank_high_low_indices(fitted["embeddings"], component_vector, n_examples)
+        if not high_idx:
             return {"high_keywords": [], "low_keywords": [], "high_examples": [], "low_examples": []}
 
-        high_idx = order[-n:][::-1]
-        low_idx = order[:n]
         high_texts = [texts[i] for i in high_idx]
         low_texts = [texts[i] for i in low_idx]
 
-        def _top_keywords(group: list[str]) -> list[str]:
-            non_empty = [t for t in group if len(t.strip()) > 2]
-            if len(non_empty) < 2:
-                return []
-            try:
-                tfidf = TfidfVectorizer(max_features=n_keywords, stop_words="english",
-                                         token_pattern=r"(?u)\b[#\w][\w]{2,}\b")
-                tfidf.fit(non_empty)
-                return list(tfidf.get_feature_names_out())
-            except Exception:
-                return []
-
         return {
-            "high_keywords": _top_keywords(high_texts),
-            "low_keywords": _top_keywords(low_texts),
+            "high_keywords": tfidf_keywords(high_texts, n_keywords),
+            "low_keywords": tfidf_keywords(low_texts, n_keywords),
             "high_examples": [str(t)[:80] for t in high_texts[:3]],
             "low_examples": [str(t)[:80] for t in low_texts[:3]],
         }

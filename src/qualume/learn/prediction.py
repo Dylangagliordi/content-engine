@@ -15,27 +15,55 @@ real n — appropriate for a model that starts genuinely small and grows
 as more accounts/videos are ingested.
 
 MERGED MODEL (added after the okn-vs-qualume comparison, per explicit
-user request): hook_text embedding features (learn/text_embedding_features.py,
-same technique as okn_mirror) are now OPTIONAL additional features
-alongside the video-content engineered features (learn/features.py).
-hook_text is the one field present on BOTH owned (static) and external
-(video) CreativeDNA — see text_embedding_features.py's module docstring
-for why this, not caption/full_transcript, is the real cross-workflow-type
-merge point. Enabled by default (use_text_embeddings=True) when
-sentence-transformers is available; set False to train on video-content
-features alone (e.g. for a fast sanity check, or when sentence-transformers
-isn't installed in that environment — degrades gracefully, never crashes).
+user request, then extended once more per "how can we use all [text/
+transcript/visual embeddings] in the prediction model and have them all
+be interpretable"): THREE optional embedding feature blocks now fold
+into the same feature vector as the video-content engineered features
+(learn.features):
+  1. hook_text embeddings (learn.text_embedding_features) — live-encoded
+     with sentence-transformers, works for owned (static) AND external
+     (video) CreativeDNA since hook_text exists on both.
+  2. transcript embeddings (learn.stored_embedding_features, reading
+     ALREADY-COMPUTED transcript_embeddings rows — Voyage voyage-3.5,
+     built by learn.transcript_embedding for HDBSCAN clustering, not
+     re-embedded here) — video-only (transcript_embeddings is keyed to
+     external_content_item_id).
+  3. visual embeddings (learn.stored_embedding_features, reading
+     ALREADY-COMPUTED visual_embeddings rows — Voyage voyage-multimodal-
+     3.5, built by learn.visual_embedding) — video-only, no associated
+     text at all (raw video frames), interpreted via structured
+     shot_breakdown metadata contrast instead of keywords.
 
-Every emb_hook_N feature surfaced by feature_importance() carries a real
-human-readable interpretation (high/low keyword contrast from the actual
-training hook_text values), not an opaque PCA label — the same
-interpretability fix built for okn_mirror, applied here (see
-text_embedding_features.explain_component).
+Every one of these is independently optional (None-safe): an item
+missing a stored transcript/visual embedding (real, incomplete coverage
+— those pipelines run on their own schedule, see
+learn/training_data.py's module docstring) simply contributes no
+emb_transcript_*/emb_visual_* signal for that row, never a fabricated
+placeholder. Enabled by default when the relevant dependency/data is
+available; each can be disabled independently via
+use_text_embeddings/use_transcript_embeddings/use_visual_embeddings.
+
+Every emb_* feature surfaced by feature_importance() carries a real
+human-readable interpretation, not an opaque PCA label — hook_text and
+transcript axes via TF-IDF high/low keyword contrast
+(text_embedding_features.explain_component /
+stored_embedding_features.explain_transcript_component); the visual axis
+(no associated text) via structured metadata-mode contrast
+(stored_embedding_features.explain_visual_component) — the same
+interpretability fix built for okn_mirror, extended to every embedding
+source in this model, not just hook_text.
 """
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OrdinalEncoder
 
 from qualume.learn.features import engineered_features
+from qualume.learn.stored_embedding_features import (
+    dominant_shot_metadata,
+    explain_transcript_component,
+    explain_visual_component,
+    fit_stored_embeddings,
+    transform_stored_embedding,
+)
 from qualume.learn.text_embedding_features import (
     HAS_EMBEDDINGS,
     explain_component,
@@ -55,29 +83,39 @@ READABLE_FEATURE_NAMES = {
 }
 
 
-def build_feature_vector(annotation: dict, text_embedder: dict | None = None) -> dict:
+def build_feature_vector(annotation: dict, text_embedder: dict | None = None,
+                          transcript_embedder: dict | None = None,
+                          visual_embedder: dict | None = None) -> dict:
     """One video's (or, once an owned-content training pipeline exists, one
     static's) full feature vector: engineered continuous features
     (learn.features, derived from shot_breakdown/full_transcript — VIDEO
     ONLY, absent/None for a static) plus the categorical/ordinal fields a
-    model can also use directly, plus OPTIONAL hook-text embedding features
-    (emb_hook_0..N) when `text_embedder` is given (a dict from
-    learn.text_embedding_features.fit_hook_text_embeddings) — these work for
-    BOTH video and static annotations, since hook_text exists on both.
+    model can also use directly, plus up to THREE optional embedding
+    feature blocks:
+      - text_embedder: hook-text embeddings (emb_hook_0..N), works for
+        video AND static annotations (hook_text exists on both).
+      - transcript_embedder: ALREADY-COMPUTED transcript embedding
+        (emb_transcript_0..N), requires annotation["transcript_embedding_vector"]
+        — video-only, absent if that item has no stored vector yet.
+      - visual_embedder: ALREADY-COMPUTED visual/frame embedding
+        (emb_visual_0..N), requires annotation["visual_embedding_vector"]
+        — video-only, absent if that item has no stored vector yet.
     `annotation` is a plain dict with keys matching the relevant
     external_creative_dna/creative_dna columns plus video_duration_seconds —
-    callers assemble this from a DB row or (in tests) a fixture; this
+    callers assemble this from a DB row (learn.training_data.fetch_training_rows
+    already includes the vector keys) or (in tests) a fixture; this
     function has no DB dependency itself.
 
     Missing/None fields produce None in the vector, never a guessed
-    default — a real validation_error row's NULL fields must stay NULL
-    through to the model, not silently become a fake 0 or 'unknown'
-    category that looks like real data.
+    default — a real validation_error row's NULL fields, or an item with
+    no stored transcript/visual embedding yet, must stay NULL through to
+    the model, not silently become a fake 0 or 'unknown' category that
+    looks like real data.
 
-    text_embedder=None (the default when called directly, NOT what
-    train_predictor passes — see that function) means NO emb_hook_* keys
-    at all, identical shape to before this feature existed — strict
-    backward compatibility for any existing caller."""
+    All three embedder args default to None (identical shape to before
+    any of these features existed) — strict backward compatibility for
+    any existing caller. train_predictor passes real fitted embedders by
+    default; see that function."""
     duration = annotation.get("video_duration_seconds")
     shots = annotation.get("shot_breakdown") or []
     transcript = annotation.get("full_transcript") or []
@@ -96,11 +134,33 @@ def build_feature_vector(annotation: dict, text_embedder: dict | None = None) ->
         for i, value in enumerate(embedded):
             vec[f"emb_hook_{i}"] = value
 
+    if transcript_embedder is not None:
+        transcript_vector = annotation.get("transcript_embedding_vector")
+        if transcript_vector is not None:
+            embedded = transform_stored_embedding(transcript_embedder, transcript_vector)
+            for i, value in enumerate(embedded):
+                vec[f"emb_transcript_{i}"] = value
+        else:
+            for i in range(transcript_embedder["n_components"]):
+                vec[f"emb_transcript_{i}"] = None
+
+    if visual_embedder is not None:
+        visual_vector = annotation.get("visual_embedding_vector")
+        if visual_vector is not None:
+            embedded = transform_stored_embedding(visual_embedder, visual_vector)
+            for i, value in enumerate(embedded):
+                vec[f"emb_visual_{i}"] = value
+        else:
+            for i in range(visual_embedder["n_components"]):
+                vec[f"emb_visual_{i}"] = None
+
     return vec
 
 
 def train_predictor(rows: list[tuple[dict, float]], min_sample_size: int = 50,
-                     use_text_embeddings: bool = True):
+                     use_text_embeddings: bool = True,
+                     use_transcript_embeddings: bool = True,
+                     use_visual_embeddings: bool = True):
     """Train a RandomForestRegressor on (annotation_dict, performance_ratio)
     pairs. Raises ValueError below min_sample_size — training on too few
     real rows produces a model that overfits completely and looks real
@@ -109,20 +169,29 @@ def train_predictor(rows: list[tuple[dict, float]], min_sample_size: int = 50,
 
     use_text_embeddings (default True): fits a hook_text embedder
     (learn.text_embedding_features.fit_hook_text_embeddings) on THIS
-    training set's own hook_text values and folds emb_hook_* features into
-    every row. Fit happens ONCE here, on the full set passed in — callers
-    doing cross-validation must fit a fresh embedder per fold (see
-    text_embedding_features's fold-safety note) rather than reusing this
-    function's single fit across folds. Set False to train on video-content
-    features alone; also degrades to False automatically (text_embedder
-    stays None) if sentence-transformers isn't installed or there aren't
-    enough real hook_text values to fit PCA meaningfully — same honest
-    "can't build this, don't fake it" discipline as fit_hook_text_embeddings
-    itself.
+    training set's own hook_text values and folds emb_hook_* features in.
 
-    Returns an opaque model object (an encoder + the fitted regressor + the
-    fitted text embedder, if any); pass it straight to predict_performance
-    or predict_performance_for_annotation, don't inspect its internals."""
+    use_transcript_embeddings / use_visual_embeddings (default True each):
+    fit a PCA reduction (learn.stored_embedding_features.fit_stored_embeddings)
+    over whichever rows have a real transcript_embedding_vector /
+    visual_embedding_vector already stored (real, incomplete coverage —
+    see learn/training_data.py) and fold emb_transcript_*/emb_visual_*
+    features into every row that has one (None for rows that don't, see
+    build_feature_vector).
+
+    Every one of these THREE embedders is fit ONCE here, on the full set
+    passed in — callers doing cross-validation must fit a fresh instance
+    of EACH per fold (see text_embedding_features's and
+    stored_embedding_features's fold-safety notes) rather than reusing
+    this function's single fit across folds. Each flag degrades to False
+    automatically (that embedder stays None) if its dependency/data is
+    unavailable or there isn't enough real data to fit meaningfully —
+    same honest "can't build this, don't fake it" discipline throughout.
+
+    Returns an opaque model object (an encoder + the fitted regressor +
+    the three fitted embedders, any of which may be None); pass it
+    straight to predict_performance or predict_performance_for_annotation,
+    don't inspect its internals."""
     if len(rows) < min_sample_size:
         raise ValueError(
             f"train_predictor needs at least {min_sample_size} real rows, got {len(rows)} — "
@@ -135,11 +204,37 @@ def train_predictor(rows: list[tuple[dict, float]], min_sample_size: int = 50,
         hook_texts = [ann.get("hook_text") or "" for ann, _ in rows]
         text_embedder = fit_hook_text_embeddings(hook_texts)
 
-    vectors = [build_feature_vector(ann, text_embedder=text_embedder) for ann, _ in rows]
+    transcript_embedder = None
+    if use_transcript_embeddings:
+        transcript_pairs = [
+            (ann["transcript_embedding_vector"], ann.get("transcript_embeddable_text") or "")
+            for ann, _ in rows if ann.get("transcript_embedding_vector") is not None
+        ]
+        if transcript_pairs:
+            vectors, aux = zip(*transcript_pairs)
+            transcript_embedder = fit_stored_embeddings(list(vectors), list(aux))
+
+    visual_embedder = None
+    if use_visual_embeddings:
+        visual_pairs = [
+            (ann["visual_embedding_vector"], dominant_shot_metadata(ann.get("shot_breakdown")))
+            for ann, _ in rows if ann.get("visual_embedding_vector") is not None
+        ]
+        if visual_pairs:
+            vectors, aux = zip(*visual_pairs)
+            visual_embedder = fit_stored_embeddings(list(vectors), list(aux))
+
+    vectors = [
+        build_feature_vector(ann, text_embedder=text_embedder,
+                              transcript_embedder=transcript_embedder,
+                              visual_embedder=visual_embedder)
+        for ann, _ in rows
+    ]
     targets = [ratio for _, ratio in rows]
 
     categorical_keys = list(CATEGORICAL_FIELDS)
-    emb_keys = [k for k in vectors[0].keys() if k.startswith("emb_hook_")]
+    emb_keys = [k for k in vectors[0].keys()
+                if k.startswith("emb_hook_") or k.startswith("emb_transcript_") or k.startswith("emb_visual_")]
     continuous_keys = [k for k in vectors[0].keys()
                         if k not in categorical_keys and k not in ORDINAL_FIELDS and k not in emb_keys]
     ordinal_keys = list(ORDINAL_FIELDS)
@@ -168,7 +263,11 @@ def train_predictor(rows: list[tuple[dict, float]], min_sample_size: int = 50,
         "ordinal_keys": ordinal_keys,
         "emb_keys": emb_keys,
         "text_embedder": text_embedder,
+        "transcript_embedder": transcript_embedder,
+        "visual_embedder": visual_embedder,
         "use_text_embeddings": text_embedder is not None,
+        "use_transcript_embeddings": transcript_embedder is not None,
+        "use_visual_embeddings": visual_embedder is not None,
     }
 
 
@@ -207,27 +306,41 @@ def predict_performance(trained, feature_vector: dict) -> float:
 def predict_performance_for_annotation(trained: dict, annotation: dict) -> float:
     """Convenience wrapper: given a trained model and a raw annotation dict
     (same shape as what train_predictor's rows used), automatically builds
-    the feature vector using the model's OWN fitted text_embedder (if any)
-    and predicts. The real ergonomics fix over predict_performance: a caller
-    predicting a new draft's performance shouldn't have to manually know
-    whether this model was trained with embeddings or thread the fitted
-    embedder through build_feature_vector themselves."""
-    vec = build_feature_vector(annotation, text_embedder=trained.get("text_embedder"))
+    the feature vector using the model's OWN fitted embedders (text,
+    transcript, visual — any of which may be None) and predicts. The real
+    ergonomics fix over predict_performance: a caller predicting a new
+    draft's performance shouldn't have to manually know which embedders
+    this model was trained with or thread them through build_feature_vector
+    themselves."""
+    vec = build_feature_vector(
+        annotation,
+        text_embedder=trained.get("text_embedder"),
+        transcript_embedder=trained.get("transcript_embedder"),
+        visual_embedder=trained.get("visual_embedder"),
+    )
     return predict_performance(trained, vec)
 
 
 def feature_importance(trained: dict, top_n: int = 10) -> list[dict]:
     """Ranked feature importances from a trained model's RandomForestRegressor
     — real gap this closes (user: "whats the point of [embeddings] if we
-    cant see them"): any emb_hook_N feature in the ranking gets a real
-    human-readable interpretation attached (high/low keyword contrast
-    from the actual training hook_text values, via
-    text_embedding_features.explain_component — same technique built for
-    okn_mirror), not left as an opaque PCA label.
+    cant see them", extended to "how can we use all [text/transcript/
+    visual embeddings] ... and have them all be interpretable"): any
+    emb_* feature in the ranking gets a real human-readable interpretation
+    attached, with the RIGHT technique per source:
+      - emb_hook_* / emb_transcript_*: TF-IDF high/low keyword contrast
+        from real text (hook_text, or the exact text embedded into the
+        stored transcript vector) — text_embedding_features.explain_component
+        / stored_embedding_features.explain_transcript_component.
+      - emb_visual_*: structured shot-metadata (setting/shot_type/
+        color_temperature) mode contrast — visual embeddings have no
+        associated text at all, so TF-IDF cannot apply; see
+        stored_embedding_features.explain_visual_component.
+    Never left as an opaque PCA label.
 
     Returns a list of {feature, raw_feature, importance, pct} dicts,
     sorted descending by importance, optionally with an "interpretation"
-    key for emb_hook_* features. Does not filter by a minimum importance
+    key for emb_* features. Does not filter by a minimum importance
     threshold (unlike okn_mirror's >0.01 cutoff) — top_n caps the list
     length instead, since this is meant for direct inspection, not a
     report section."""
@@ -248,5 +361,11 @@ def feature_importance(trained: dict, top_n: int = 10) -> list[dict]:
         if name.startswith("emb_hook_") and trained.get("text_embedder") is not None:
             component_idx = int(name.split("_")[-1])
             entry["interpretation"] = explain_component(trained["text_embedder"], component_idx)
+        elif name.startswith("emb_transcript_") and trained.get("transcript_embedder") is not None:
+            component_idx = int(name.split("_")[-1])
+            entry["interpretation"] = explain_transcript_component(trained["transcript_embedder"], component_idx)
+        elif name.startswith("emb_visual_") and trained.get("visual_embedder") is not None:
+            component_idx = int(name.split("_")[-1])
+            entry["interpretation"] = explain_visual_component(trained["visual_embedder"], component_idx)
         results.append(entry)
     return results
