@@ -18,7 +18,7 @@ import pytest
 from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_VERSION
 from qualume.db.connection import get_connection
 from qualume.db.watchlist import add_watched_account
-from qualume.learn.training_data import fetch_training_rows
+from qualume.learn.training_data import fetch_training_rows, fetch_training_rows_pooled
 
 
 def _cleanup_account(handle: str):
@@ -267,3 +267,77 @@ def test_fetch_training_rows_handles_partial_stored_embedding_coverage(fake_nich
     with_visual = sum(1 for ann, _ in rows if ann["visual_embedding_vector"] is not None)
     assert with_transcript == 1
     assert with_visual == 1
+
+
+# ──────────────────────────────────────────────
+# Pooled training — added 2026-11-05 for the predictive-model data-
+# scarcity fix: fetch across MULTIPLE/all niches, tagging each
+# annotation with its real niche so train_predictor can use niche as a
+# categorical feature instead of training one starved model per niche.
+# ──────────────────────────────────────────────
+
+def test_fetch_training_rows_pooled_tags_every_annotation_with_its_real_niche(fake_niche):
+    account_id, items = fake_niche
+    rows = fetch_training_rows_pooled(niches=["zz_test_training_niche"])
+    assert len(rows) == 6
+    for annotation, _ in rows:
+        assert annotation["niche"] == "zz_test_training_niche"
+
+
+def test_fetch_training_rows_pooled_combines_multiple_real_niches(fake_niche):
+    account_id, items = fake_niche
+    other_handle = f"zz_test_pooled_other_{uuid.uuid4().hex[:8]}"
+    _cleanup_account(other_handle)
+    other_account = add_watched_account("tiktok", other_handle, niche="zz_test_pooled_other_niche")
+    other_item = _insert_item(other_account)
+    _insert_dna(other_item)
+    _insert_snapshot(other_item, views=500)
+
+    try:
+        rows = fetch_training_rows_pooled(niches=["zz_test_training_niche", "zz_test_pooled_other_niche"])
+        niches_seen = {ann["niche"] for ann, _ in rows}
+        assert niches_seen == {"zz_test_training_niche", "zz_test_pooled_other_niche"}
+        assert len(rows) == 7  # 6 from the fixture + 1 from the other niche
+    finally:
+        _cleanup_account(other_handle)
+
+
+def test_fetch_training_rows_pooled_with_no_niches_arg_fetches_everything(fake_niche):
+    """niches=None (the default) means no niche filter at all — every
+    real niche currently in the DB, not just this test's fixture. Can't
+    assert an exact count (real production data varies), just that the
+    fixture's own niche shows up and every real row is correctly tagged."""
+    account_id, items = fake_niche
+    rows = fetch_training_rows_pooled(niches=None)
+    niches_seen = {ann["niche"] for ann, _ in rows}
+    assert "zz_test_training_niche" in niches_seen
+    # every single row must have a real, non-None niche (the JOIN is INNER
+    # on watched_accounts, which always has a niche column — None would
+    # mean a real bug in the tagging, not a real unclassified account,
+    # since _fetch_candidate_items doesn't filter out NULL niches itself)
+    for annotation, _ in rows:
+        assert "niche" in annotation
+
+
+def test_fetch_training_rows_pooled_skips_items_without_a_real_performance_baseline(fake_niche):
+    account_id, items = fake_niche
+    unscored_item = _insert_item(account_id)
+    _insert_dna(unscored_item)
+    # Deliberately no snapshot for this one.
+
+    rows = fetch_training_rows_pooled(niches=["zz_test_training_niche"])
+    assert len(rows) == 6  # the unscored item is excluded, not crashing the fetch
+
+
+def test_fetch_training_rows_pooled_includes_stored_embeddings_same_as_single_niche(fake_niche):
+    """The pooled path must carry the exact same embedding-vector shape
+    as fetch_training_rows (same _build_annotation helper) — not a
+    second, drifted implementation."""
+    account_id, items = fake_niche
+    for item_id in items:
+        _insert_transcript_embedding(item_id)
+
+    rows = fetch_training_rows_pooled(niches=["zz_test_training_niche"])
+    for annotation, _ in rows:
+        assert annotation["transcript_embedding_vector"] is not None
+        assert len(annotation["transcript_embedding_vector"]) == 1024
