@@ -1,7 +1,126 @@
 # Qualume — Session Handoff (2026-11-04, lifecycle gaps closed: niche-scoping, model persistence, run_batch scoring)
 
 ## Start here next session
-Read this file first, not chat history.
+Read this file first, not chat history. Most recent section is at the TOP — see
+"2026-11-08: merge into one coherent system" below for the latest state.
+
+## 2026-11-08: merge into one coherent system — per-niche ML removed, 4 okn_mirror pieces ported, pooled predictor live
+
+Executed `.hermes/plans/2026-11-08_140848-merge-coherent-content-intelligence-system.md`
+top to bottom (that plan already had the design decisions settled from earlier in this
+session — see it for the full reasoning if picking this up fresh). Summary of what
+actually shipped, every number verified live against the real Postgres instance, not
+assumed:
+
+### What changed
+1. **`learn/prediction.py`**: `"niche"` added to `CATEGORICAL_FIELDS` — the predictive
+   model now treats niche as a feature (same OrdinalEncoder mechanism as
+   hook_type/format_tag) instead of being hard-partitioned by niche. Mining/clustering/
+   anomaly-detection/tiering stay niche-REQUIRED (peer-relative claims need a peer
+   group) — only the RandomForest/GB/MLP predictive models pool across niches now.
+2. **`learn/ensemble_models.py`** (new): `train_ensemble()`/`predict_with_all_models()`
+   — GradientBoostingRegressor + MLPRegressor trained on the IDENTICAL pooled feature
+   matrix as the primary RandomForest, as second-opinion corroborating signal (ported
+   from okn_mirror's `_feature_importance`/`_engagement_predictor`).
+3. **`learn/anomaly_detection.py`** (new): `detect_anomalies(niche)` — IsolationForest,
+   niche-scoped, flags `viral_outlier`/`underperformer_outlier` with no prior hypothesis
+   needed (genuinely new capability vs. `learn.replication`, which only checks a KNOWN
+   claim). Ported from okn_mirror's `_anomaly_detection`.
+4. **`learn/performance_tiers.py`** (new): `compute_performance_tiers(niche)` — KMeans
+   forced k=2-3, niche-scoped, buckets into `[TOP]`/`[AVG]`/`[LOW]` ordinal tiers — a
+   distinct job from HDBSCAN's open-ended structural clusters. Ported from okn_mirror's
+   `_content_clustering`.
+5. **`orchestrate.py`**: anomaly detection + performance tiering wired in as the 8th/9th
+   niche-scoped stages (same per-niche isolation shape as mining/clustering/
+   visual_clustering — one niche's failure never blocks another, or another stage).
+6. **`learn/model_persistence.py`**: added `save_pooled_predictor`/`load_pooled_predictor`/
+   `load_pooled_metadata`/`has_saved_pooled_predictor` — a SEPARATE function pair from
+   the niche-keyed `save_predictor`/`load_predictor` (both coexist on disk without
+   collision, verified by a real test). Pooled metadata tracks `niches_represented`
+   (sorted list + count) so a caller can see at a glance which real niches actually
+   contributed, without loading the full artifact.
+7. **`scripts/train_and_save_all_predictors.py`**: rewritten from "loop over niches,
+   save N models" to "fetch pooled rows once, train one ensemble, save once."
+8. **`run_batch.py`**: `score_variant_if_model_available` now loads the ONE pooled model
+   (`has_saved_pooled_predictor`/`load_pooled_predictor`) and passes niche as part of
+   the annotation dict (handled via `CATEGORICAL_FIELDS`) instead of looking up a
+   per-niche model file. Works correctly with niche=None too (unseen-value safety, same
+   as hook_type).
+
+### Real numbers, verified live (not assumed)
+- Pooled training rows: **2,149** (up from the old per-niche floor that left 48+ of 56
+  real niches permanently un-modeled).
+- Niches represented in the pooled dataset: **56** (the watchlist grew since the
+  original 27-niche count cited earlier this session — confirms that number is stale;
+  56 is the current real figure).
+- `"niche"` as a feature: real, honest, mid-tier importance — **7.6-7.8%**, 3rd place in
+  top-15 RandomForest feature importance (not dominant, not negligible) — validates the
+  pooling decision without overclaiming it.
+- Real production training run (`scripts/train_and_save_all_predictors.py`): RF + GB +
+  MLP all trained successfully in ~33s, saved to `data/models/pooled_predictor.joblib`
+  (gitignored, 25MB — the embedding dimensionality makes this artifact much larger than
+  any single old per-niche model was).
+- `run_batch.score_variant_if_model_available` verified live against the real saved
+  pooled model: a real ScriptVariant scored successfully both with a real niche
+  (fitness/workout content → 11.57x account-median) and with niche=None (19.91x).
+- Full test suite: **486 passed**, 0 failures (up from 455 at the end of the previous
+  session). Zero leftover `zz_test_*`/`test_*` DB fixtures after the run — every test's
+  `finally`-block cleanup held.
+
+### Real bug found + fixed as a byproduct (not part of the original plan, but blocking verification)
+`tests/test_orchestrate.py` (17 of 18 tests) and both tests in
+`tests/test_orchestrate_pause_ingestion.py` never mocked
+`find_pending_content_type_classification`/`classify_and_store_content_type` — every
+run of these tests was silently making REAL Claude API calls against the live
+content_type backlog (504 pending items at time of discovery) and REAL DB queries
+against all 56 real niches for mining/clustering, on every single test invocation. This
+had been true since the content_type stage was added (well before this session) and
+made the orchestrate test files take minutes instead of seconds while spending real API
+budget per test run. Found because adding the new anomaly_detection/performance_tiers
+stages made the pre-existing problem bad enough to time out outright. Fixed by adding
+the missing mocks everywhere real_ingestion_cycle() is exercised; `test_orchestrate.py`
+now runs in ~5s (was timing out at 180s+).
+
+### What's explicitly OUT of scope (confirmed, don't re-add without asking)
+okn_mirror's momentum score, content fatigue, posting cadence, TF-IDF caption-lift,
+topic discovery, similar-post KNN, hashtag clusters, and all 8 rule-based
+`analyze_okn.py` modules — discussed earlier this session as "genuinely new, not yet
+built" but the user's final instruction narrowed scope to exactly: niche-split removal
++ IsolationForest + KMeans + GradientBoosting + MLPRegressor. Cross-validation is ALSO
+still explicitly out of scope for this plan (see below) — don't conflate "add ensemble
+models" with "cross-validate the ensemble."
+
+## What's actually NOT done yet (don't assume otherwise)
+- CROSS-VALIDATION — flagged repeatedly across many sessions now, still not built.
+  Every R²/importance/correlation number produced so far (RF, GB, MLP, okn_mirror's own
+  GB) is IN-SAMPLE only. Still the single most load-bearing open item before trusting
+  any of these numbers for a real decision.
+- `scripts/train_and_save_all_predictors.py` is not scheduled anywhere (cron/
+  orchestrator) — the pooled model will go stale as new annotated data accumulates
+  unless someone re-runs it by hand.
+- `learn/anomaly_detection.py`/`learn/performance_tiers.py` are wired into
+  `orchestrate.py` but have never run a FULL live cycle against production data yet
+  (only verified via direct unit-level calls + the orchestrator's mocked test suite) —
+  watch the first few real scheduled cycles and confirm they don't error out at real
+  volume (56 niches × 2 new stages per cycle).
+- Foundational docs rebuild, LangGraph agent skeleton, roster skill update — untouched,
+  carried forward from earlier sessions.
+- Instagram account-risk decision, owned-content publishing loop (actually publishing a
+  generated static, not just scoring the draft), separate test DB — all still open,
+  unchanged.
+
+## Immediate next action when picking this back up
+1. Cross-validation — still the single most load-bearing open item, flagged repeatedly.
+2. Decide whether `train_and_save_all_predictors.py` (now pooled, one run instead of
+   N) should run on a schedule so the saved pooled model doesn't go stale.
+3. Watch the first few real live orchestrator cycles with anomaly_detection/
+   performance_tiers actually running against production data (not just mocked tests)
+   — confirm no crash/timeout at real 56-niche volume.
+4. Run a real `run_batch.py` batch end-to-end via the actual CLI entry point (`python -m
+   qualume.run_batch`) to confirm the pooled-model scoring path works outside direct
+   function calls too — only verified via direct calls + tests so far.
+
+---
 
 ## Project state (verified live via DB queries this session, not assumed)
 - 17,999 total external_content_items, 1,553 annotated (external_creative_dna rows), 65
