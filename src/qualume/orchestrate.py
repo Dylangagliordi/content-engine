@@ -22,6 +22,8 @@ from qualume.annotate.gemini_watcher import ANALYSIS_PROMPT_VERSION as DNA_ANALY
 from qualume.annotate.gemini_watcher import annotate_and_store
 from qualume.db.watchlist import list_distinct_niches
 from qualume.ingest.tiktok_reader import download_pending_videos
+from qualume.learn.anomaly_detection import detect_anomalies
+from qualume.learn.performance_tiers import compute_performance_tiers
 from qualume.learn.run_cluster_pass import run_cluster_pass
 from qualume.learn.run_mining_pass import run_mining_pass
 from qualume.learn.run_visual_cluster_pass import run_visual_cluster_pass
@@ -386,5 +388,48 @@ def run_ingestion_cycle() -> dict:
         }
     except Exception as e:
         result["visual_clustering"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # Anomaly detection — 8th stage, added 2026-11-08 per explicit
+        # user decision ("add in isolation forest ... all wired into one
+        # system"). Same NICHE-SCOPED LOOP real-fix shape as mining/
+        # clustering/visual_clustering above — outlier-ness is inherently
+        # peer-relative (learn.anomaly_detection's own docstring), so an
+        # unscoped pass here would be semantically meaningless, not just
+        # noisier. Independent of mining/clustering — a scikit-learn/DB
+        # hiccup here must not block either of those already-proven
+        # stages, and vice versa.
+        niches = list_distinct_niches()
+        anomaly_detection_by_niche: dict = {}
+        for niche in niches:
+            try:
+                anomaly_detection_by_niche[niche] = detect_anomalies(niche=niche)
+            except Exception as e:
+                anomaly_detection_by_niche[niche] = {"error": f"{type(e).__name__}: {e}"}
+        result["anomaly_detection"] = {
+            "niches_processed": len(niches), "by_niche": anomaly_detection_by_niche,
+        }
+    except Exception as e:
+        result["anomaly_detection"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        # Performance tiering — 9th stage, added 2026-11-08, same explicit
+        # user decision and NICHE-SCOPED LOOP shape as anomaly detection
+        # above. A distinct job from HDBSCAN clustering (fixed ordinal
+        # top/avg/low bands vs. open-ended structural groups) — kept as
+        # its own stage so a tiering failure never blocks anomaly
+        # detection, mining, or either clustering pass.
+        niches = list_distinct_niches()
+        performance_tiers_by_niche: dict = {}
+        for niche in niches:
+            try:
+                performance_tiers_by_niche[niche] = compute_performance_tiers(niche=niche)
+            except Exception as e:
+                performance_tiers_by_niche[niche] = {"error": f"{type(e).__name__}: {e}"}
+        result["performance_tiers"] = {
+            "niches_processed": len(niches), "by_niche": performance_tiers_by_niche,
+        }
+    except Exception as e:
+        result["performance_tiers"] = {"error": f"{type(e).__name__}: {e}"}
 
     return result

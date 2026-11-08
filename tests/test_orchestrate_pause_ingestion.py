@@ -21,9 +21,13 @@ def test_run_ingestion_cycle_skips_poll_and_download_when_ingestion_paused():
          patch("qualume.orchestrate.download_pending_videos") as mock_download, \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.find_pending_content_type_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=[]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
-         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.detect_anomalies", return_value={}), \
+         patch("qualume.orchestrate.compute_performance_tiers", return_value={}):
 
         result = run_ingestion_cycle()
 
@@ -48,9 +52,13 @@ def test_run_ingestion_cycle_runs_poll_and_download_when_not_paused():
          patch("qualume.orchestrate.download_pending_videos") as mock_download, \
          patch("qualume.orchestrate.find_pending_annotation", return_value=[]), \
          patch("qualume.orchestrate.find_pending_classification", return_value=[]), \
+         patch("qualume.orchestrate.find_pending_content_type_classification", return_value=[]), \
+         patch("qualume.orchestrate.list_distinct_niches", return_value=[]), \
          patch("qualume.orchestrate.run_mining_pass", return_value={}), \
          patch("qualume.orchestrate.run_cluster_pass", return_value={}), \
-         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}):
+         patch("qualume.orchestrate.run_visual_cluster_pass", return_value={}), \
+         patch("qualume.orchestrate.detect_anomalies", return_value={}), \
+         patch("qualume.orchestrate.compute_performance_tiers", return_value={}):
 
         mock_poll.return_value = {"accounts_polled": 1}
         mock_download.return_value = {"downloaded": 0}
