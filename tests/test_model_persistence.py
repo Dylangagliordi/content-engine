@@ -148,3 +148,104 @@ def test_niche_to_filename_handles_real_niche_strings_safely():
     # two different real niches must not collapse to the same filename
     assert (_niche_to_filename("fitness/workout content")
             != _niche_to_filename("fitness workout content"))
+
+
+def _pooled_rows(n=60):
+    rows = []
+    for i in range(n):
+        niche = "fitness/workout content" if i % 2 == 0 else "food/cooking/recipe content"
+        ann = _annotation(energy_level=i % 5 + 1)
+        ann["niche"] = niche
+        ratio = 2.0 if niche == "fitness/workout content" else 0.5
+        rows.append((ann, ratio))
+    return rows
+
+
+def test_save_pooled_predictor_writes_a_real_model_file_and_metadata_file():
+    from qualume.learn.model_persistence import load_pooled_metadata, pooled_model_path, save_pooled_predictor
+
+    trained = train_predictor(_pooled_rows(), min_sample_size=50, use_text_embeddings=False)
+    niches = ["fitness/workout content", "food/cooking/recipe content"]
+    path = save_pooled_predictor(trained, n_training_rows=60, niches_represented=niches)
+
+    assert path.exists()
+    assert path == pooled_model_path()
+    meta = load_pooled_metadata()
+    assert meta["n_training_rows"] == 60
+    assert meta["n_niches_represented"] == 2
+    assert meta["niches_represented"] == sorted(niches)
+    assert "trained_at" in meta
+
+
+def test_load_pooled_predictor_round_trips_to_a_real_working_model():
+    from qualume.learn.model_persistence import load_pooled_predictor, save_pooled_predictor
+
+    trained = train_predictor(_pooled_rows(), min_sample_size=50, use_text_embeddings=False)
+    save_pooled_predictor(trained, n_training_rows=60,
+                           niches_represented=["fitness/workout content", "food/cooking/recipe content"])
+
+    loaded = load_pooled_predictor()
+    assert loaded is not None
+    assert loaded is not trained
+
+    fitness_vec = build_feature_vector(_annotation())
+    fitness_vec["niche"] = "fitness/workout content"
+    food_vec = build_feature_vector(_annotation())
+    food_vec["niche"] = "food/cooking/recipe content"
+    fitness_pred = predict_performance(loaded, fitness_vec)
+    food_pred = predict_performance(loaded, food_vec)
+    assert fitness_pred > food_pred  # the loaded pooled model still learned the real signal
+
+
+def test_load_pooled_predictor_returns_none_when_nothing_saved_yet():
+    from qualume.learn.model_persistence import load_pooled_predictor
+
+    assert load_pooled_predictor() is None
+
+
+def test_has_saved_pooled_predictor_reflects_real_file_presence():
+    from qualume.learn.model_persistence import has_saved_pooled_predictor, save_pooled_predictor
+
+    assert has_saved_pooled_predictor() is False
+    trained = train_predictor(_pooled_rows(), min_sample_size=50, use_text_embeddings=False)
+    save_pooled_predictor(trained, n_training_rows=60,
+                           niches_represented=["fitness/workout content", "food/cooking/recipe content"])
+    assert has_saved_pooled_predictor() is True
+
+
+def test_save_pooled_predictor_overwrites_a_previous_save():
+    from qualume.learn.model_persistence import load_pooled_metadata, save_pooled_predictor
+
+    trained1 = train_predictor(_pooled_rows(60), min_sample_size=50, use_text_embeddings=False)
+    save_pooled_predictor(trained1, n_training_rows=60,
+                           niches_represented=["fitness/workout content", "food/cooking/recipe content"])
+    first_meta = load_pooled_metadata()
+
+    trained2 = train_predictor(_pooled_rows(80), min_sample_size=50, use_text_embeddings=False)
+    save_pooled_predictor(trained2, n_training_rows=80,
+                           niches_represented=["fitness/workout content", "food/cooking/recipe content"])
+    second_meta = load_pooled_metadata()
+
+    assert second_meta["n_training_rows"] == 80
+    assert second_meta["n_training_rows"] != first_meta["n_training_rows"]
+
+
+def test_pooled_and_niche_keyed_saves_do_not_collide():
+    """The pooled path and the niche-keyed path must coexist on disk
+    without clobbering each other - two genuinely separate artifacts."""
+    from qualume.learn.model_persistence import (
+        has_saved_pooled_predictor,
+        has_saved_predictor,
+        save_pooled_predictor,
+        save_predictor,
+    )
+
+    niche_trained = train_predictor(_real_rows(), min_sample_size=20, use_text_embeddings=False)
+    save_predictor(niche_trained, niche="zz_test_coexist", n_training_rows=25)
+
+    pooled_trained = train_predictor(_pooled_rows(), min_sample_size=50, use_text_embeddings=False)
+    save_pooled_predictor(pooled_trained, n_training_rows=60,
+                           niches_represented=["fitness/workout content", "food/cooking/recipe content"])
+
+    assert has_saved_predictor("zz_test_coexist") is True
+    assert has_saved_pooled_predictor() is True

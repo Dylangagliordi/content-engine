@@ -144,3 +144,84 @@ def load_metadata(niche: str) -> dict | None:
 
 def has_saved_predictor(niche: str) -> bool:
     return model_path(niche).exists()
+
+
+# POOLED MODEL (added 2026-11-08, same pooled-training fix as
+# learn.training_data.fetch_training_rows_pooled / learn.prediction's
+# "niche" categorical feature — see those modules' docstrings for the
+# full reasoning). The predictive model is no longer trained/saved per
+# niche; it's trained ONCE on the pooled feature matrix (niche folded in
+# as a categorical feature) and saved ONCE. Kept as a SEPARATE function
+# pair (not a magic "__pooled__" niche string through save_predictor/
+# load_predictor) so the pooled path can never collide with a real
+# niche string and is self-documenting at the call site — the niche-
+# keyed functions above are left completely unchanged for any caller
+# that still wants a single-niche model for comparison purposes.
+
+POOLED_MODEL_FILENAME = "pooled_predictor.joblib"
+POOLED_METADATA_FILENAME = "pooled_predictor.meta.json"
+
+
+def pooled_model_path() -> Path:
+    return MODELS_DIR / POOLED_MODEL_FILENAME
+
+
+def pooled_metadata_path() -> Path:
+    return MODELS_DIR / POOLED_METADATA_FILENAME
+
+
+def save_pooled_predictor(trained: dict, n_training_rows: int, niches_represented: list[str]) -> Path:
+    """Persist the ONE pooled predictor (trained across all/many real
+    niches, niche folded in as a categorical feature - see
+    learn.training_data.fetch_training_rows_pooled). Same strip-the-
+    internal-training-arrays discipline as save_predictor. Overwrites
+    any existing pooled save - same 'latest wins' discipline as the
+    niche-keyed path.
+
+    niches_represented is stored in the metadata (not the model itself)
+    so a caller can see at a glance which real niches actually
+    contributed to this specific saved model, without loading the full
+    artifact - same honest-provenance discipline as embedders_used
+    below."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    to_save = {k: v for k, v in trained.items() if not k.startswith("_")}
+    path = pooled_model_path()
+    joblib.dump(to_save, path)
+
+    meta = {
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "n_training_rows": n_training_rows,
+        "niches_represented": sorted(niches_represented),
+        "n_niches_represented": len(niches_represented),
+        "embedders_used": {
+            "text": trained.get("text_embedder") is not None,
+            "transcript": trained.get("transcript_embedder") is not None,
+            "visual": trained.get("visual_embedder") is not None,
+        },
+    }
+    pooled_metadata_path().write_text(json.dumps(meta, indent=2))
+    logger.info("Saved pooled predictor to %s (n=%s, niches=%s)",
+                path, n_training_rows, len(niches_represented))
+    return path
+
+
+def load_pooled_predictor() -> dict | None:
+    """Load the saved pooled predictor, or None if none has been saved
+    yet - same refuse-rather-than-guess discipline as load_predictor."""
+    path = pooled_model_path()
+    if not path.exists():
+        return None
+    return joblib.load(path)
+
+
+def load_pooled_metadata() -> dict | None:
+    """The saved pooled model's metadata (trained_at/n_training_rows/
+    niches_represented/embedders_used), or None if none exists."""
+    path = pooled_metadata_path()
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def has_saved_pooled_predictor() -> bool:
+    return pooled_model_path().exists()
