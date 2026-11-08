@@ -52,6 +52,24 @@ stored_embedding_features.explain_transcript_component); the visual axis
 (stored_embedding_features.explain_visual_component) — the same
 interpretability fix built for okn_mirror, extended to every embedding
 source in this model, not just hook_text.
+
+NICHE AS A CATEGORICAL FEATURE (added 2026-11-08, same pooled-training
+fix as learn.training_data.fetch_training_rows_pooled — see that
+module's "POOLED TRAINING" docstring section for the full reasoning):
+"niche" is now in CATEGORICAL_FIELDS, so any annotation dict carrying a
+real "niche" key (fetch_training_rows_pooled tags every row with one)
+gets it encoded exactly like hook_type/format_tag — same OrdinalEncoder,
+same handle_unknown="use_encoded_value" safety for a niche never seen
+during training. fetch_training_rows (single-niche, mining/clustering-
+style) never sets this key, so it's simply None there — build_feature_vector's
+existing .get()-based None-safety (same as every other categorical field)
+means this is fully backward compatible, not a breaking change. The
+justification for pooling the PREDICTIVE model across niches (rather
+than hard-partitioning it like mining/clustering must be) is that
+learn.baseline.performance_vs_baseline already account-relativizes the
+target (ratio_to_median) before niche enters the picture — RandomForest's
+own splits can discover real niche-interaction effects natively instead
+of each niche being stuck with its own tiny, separately-trained model.
 """
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OrdinalEncoder
@@ -71,11 +89,12 @@ from qualume.learn.text_embedding_features import (
     transform_hook_text,
 )
 
-CATEGORICAL_FIELDS = ("hook_type", "format_tag")
+CATEGORICAL_FIELDS = ("hook_type", "format_tag", "niche")
 ORDINAL_FIELDS = ("energy_level",)
 
 READABLE_FEATURE_NAMES = {
     "hook_type": "Hook Type", "format_tag": "Format", "energy_level": "Energy Level",
+    "niche": "Niche",
     "cuts_per_min": "Cuts Per Minute", "avg_shot_length_sec": "Avg Shot Length",
     "shot_length_stddev": "Shot Length Variability", "color_temperature_consistency": "Color Temp Consistency",
     "setting_change_count": "Setting Changes", "shot_type_variety": "Shot Type Variety",

@@ -429,3 +429,39 @@ def test_feature_importance_correlation_is_none_when_insufficient_real_data():
     energy = next(f for f in result if f["raw_feature"] == "energy_level")
     assert energy["correlation"] is None
     assert energy["direction"] == "no variance / insufficient data"
+
+
+def test_build_feature_vector_includes_niche_when_present_in_annotation():
+    ann = _annotation()
+    ann["niche"] = "fitness/workout content"
+    vec = build_feature_vector(ann)
+    assert vec.get("niche") == "fitness/workout content"
+
+
+def test_build_feature_vector_niche_is_none_when_absent():
+    vec = build_feature_vector(_annotation())  # no "niche" key at all
+    assert vec.get("niche") is None
+
+
+def test_train_predictor_treats_niche_as_a_categorical_feature():
+    rows = []
+    for i in range(60):
+        niche = "fitness/workout content" if i % 2 == 0 else "food/cooking/recipe content"
+        ann = _annotation(energy_level=i % 5 + 1)
+        ann["niche"] = niche
+        # real injected signal: fitness rows score higher than food rows
+        ratio = 2.0 if niche == "fitness/workout content" else 0.5
+        rows.append((ann, ratio))
+    trained = train_predictor(rows, min_sample_size=50, use_text_embeddings=False)
+    assert "niche" in trained["categorical_keys"]
+
+
+def test_predict_performance_for_annotation_works_without_niche_backward_compat():
+    """Existing single-niche callers (fetch_training_rows, no "niche" key)
+    must keep working unchanged - niche is OPTIONAL, not required."""
+    rows = [(_annotation(energy_level=i % 5 + 1), float(i % 5 + 1)) for i in range(25)]
+    trained = train_predictor(rows, min_sample_size=20, use_text_embeddings=False)
+    assert "niche" in trained["categorical_keys"]  # always tracked now, just None-valued
+    vec = build_feature_vector(_annotation())
+    result = predict_performance(trained, vec)
+    assert isinstance(result, float)
