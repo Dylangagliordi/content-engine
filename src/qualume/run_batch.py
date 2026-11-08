@@ -32,7 +32,7 @@ from qualume.graphs import write_ig_static, design_ig_static
 from qualume.models.contracts import CampaignBrief, DesignRequest, ScriptVariant
 from qualume.eval.harness import load_golden_set, run_constraint_checks
 from qualume.db.connection import get_connection
-from qualume.learn.model_persistence import has_saved_predictor, load_predictor
+from qualume.learn.model_persistence import has_saved_pooled_predictor, load_pooled_predictor
 from qualume.learn.prediction import predict_performance_for_annotation
 
 GOLDEN_SET_PATH = "src/qualume/eval/golden_sets/ig_static_write_v1.jsonl"
@@ -92,14 +92,26 @@ def build_eval_example_for_brief(brief_text: str, universal_avoid: list[str]) ->
 
 
 def score_variant_if_model_available(variant: ScriptVariant, niche: str | None) -> float | None:
-    """Score one generated ScriptVariant against its niche's saved
-    prediction model (learn.model_persistence), if one exists. Returns
-    None — never a fabricated number — when niche is None (no niche was
-    given to this batch run) or no model has been saved for that niche
-    yet (below the training floor, or scripts/train_and_save_all_predictors.py
-    hasn't been run for it). This is the real wiring gap closed 2026-11-04:
-    the trained model existed and was verified, but nothing in the real
-    generation pipeline ever called it before persisting a draft.
+    """Score one generated ScriptVariant against the ONE saved pooled
+    prediction model (learn.model_persistence.load_pooled_predictor),
+    if one has been trained/saved. Returns None — never a fabricated
+    number — when no pooled model has been saved yet (below the
+    training floor, or scripts/train_and_save_all_predictors.py hasn't
+    been run). This is the real wiring gap closed 2026-11-04 (and
+    re-wired 2026-11-08 to the pooled model, per the "get rid of the
+    per niche split in the ml models" decision — see
+    learn.training_data's module docstring for the full pooled-training
+    reasoning): the trained model existed and was verified, but nothing
+    in the real generation pipeline ever called it before persisting a
+    draft.
+
+    niche (if given) is passed as part of the annotation dict instead
+    of being used to look up a per-niche model file — the pooled model
+    was trained with "niche" as a categorical feature (see
+    learn.prediction's CATEGORICAL_FIELDS), so it's handled exactly like
+    hook_type/format_tag: a real niche contributes real signal, None
+    degrades gracefully via the same OrdinalEncoder unknown-value
+    safety every other categorical field already has.
 
     Builds the annotation dict from the variant's own real fields
     (hook_type comes from the DESIGN stage's CreativeDNA, not available
@@ -109,15 +121,14 @@ def score_variant_if_model_available(variant: ScriptVariant, niche: str | None) 
     statics have no shot_breakdown/full_transcript/duration at all (see
     learn.prediction's own module docstring on why hook_text is the
     cross-workflow-type merge point)."""
-    if niche is None:
+    if not has_saved_pooled_predictor():
         return None
-    if not has_saved_predictor(niche):
-        return None
-    trained = load_predictor(niche)
+    trained = load_pooled_predictor()
     annotation = {
         "hook_type": None, "format_tag": None, "energy_level": None,
         "shot_breakdown": [], "full_transcript": [], "video_duration_seconds": None,
         "hook_text": variant.hook_text,
+        "niche": niche,
     }
     return predict_performance_for_annotation(trained, annotation)
 

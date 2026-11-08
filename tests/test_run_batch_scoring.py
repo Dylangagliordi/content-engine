@@ -20,7 +20,7 @@ import uuid
 import pytest
 
 from qualume.db.connection import get_connection
-from qualume.learn.model_persistence import save_predictor
+from qualume.learn.model_persistence import save_pooled_predictor
 from qualume.learn.prediction import train_predictor
 from qualume.models.contracts import CreativeDNA, DesignOutput, ScriptVariant
 from qualume.run_batch import insert_content_item, score_variant_if_model_available
@@ -53,30 +53,43 @@ def _script_variant(hook_text="a real hook about the product"):
     )
 
 
-def test_score_variant_returns_none_when_no_model_saved_for_niche():
-    """Real, expected state — a niche nobody has trained a model for
-    yet. None, not an exception, not a fabricated score — same refuse-
-    rather-than-guess discipline as every other learn.* module."""
+def test_score_variant_returns_none_when_no_pooled_model_saved():
+    """Real, expected state — nobody has trained + saved the pooled
+    model yet. None, not an exception, not a fabricated score — same
+    refuse-rather-than-guess discipline as every other learn.* module."""
     variant = _script_variant()
     score = score_variant_if_model_available(variant, niche="zz_test_no_model_niche")
     assert score is None
 
 
-def test_score_variant_returns_none_when_niche_is_none():
+def test_score_variant_returns_none_when_niche_is_none_but_no_model_saved():
     """A batch run with no --niche argument is a real, valid case (e.g.
-    local testing) — must not try to score against a non-existent
-    'None' niche's model, just skip scoring entirely."""
+    local testing) — with no pooled model saved yet, this must still
+    return None, not try to score against a non-existent model."""
     variant = _script_variant()
     score = score_variant_if_model_available(variant, niche=None)
     assert score is None
 
 
-def test_score_variant_returns_a_real_float_when_a_model_exists():
+def test_score_variant_returns_a_real_float_when_the_pooled_model_exists():
     trained = train_predictor(_real_training_rows(), min_sample_size=20, use_text_embeddings=False)
-    save_predictor(trained, niche="zz_test_scoring_niche", n_training_rows=25)
+    save_pooled_predictor(trained, n_training_rows=25, niches_represented=["zz_test_scoring_niche"])
 
     variant = _script_variant(hook_text="a real hook number 3")
     score = score_variant_if_model_available(variant, niche="zz_test_scoring_niche")
+    assert isinstance(score, float)
+
+
+def test_score_variant_works_with_niche_none_once_a_pooled_model_exists():
+    """A real niche-None caller (no --niche given) must still get a real
+    score once a pooled model is saved — the pooled model's OrdinalEncoder
+    handles a None/unseen niche the same safe way it handles an unseen
+    hook_type, never raising."""
+    trained = train_predictor(_real_training_rows(), min_sample_size=20, use_text_embeddings=False)
+    save_pooled_predictor(trained, n_training_rows=25, niches_represented=["zz_test_scoring_niche"])
+
+    variant = _script_variant()
+    score = score_variant_if_model_available(variant, niche=None)
     assert isinstance(score, float)
 
 
@@ -88,7 +101,7 @@ def test_score_variant_uses_the_variant_hook_text_not_a_fabricated_one():
     trained = train_predictor(_real_training_rows(30), min_sample_size=20, use_text_embeddings=True)
     if trained["text_embedder"] is None:
         pytest.skip("sentence-transformers unavailable in this environment")
-    save_predictor(trained, niche="zz_test_scoring_hooktext", n_training_rows=30)
+    save_pooled_predictor(trained, n_training_rows=30, niches_represented=["zz_test_scoring_hooktext"])
 
     score_a = score_variant_if_model_available(
         _script_variant(hook_text="a completely unique hook about cooking recipes"),
